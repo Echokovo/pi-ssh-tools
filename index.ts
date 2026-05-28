@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, join } from "node:path";
+import { extname, isAbsolute, join, relative, sep } from "node:path";
 import {
 	type BashOperations,
 	createBashToolDefinition,
@@ -43,6 +43,44 @@ const SSH_CONFIG_PATH = join(homedir(), ".ssh", "config");
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function normalizeRemoteDir(path: string): string {
+	return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
+function remoteRelativePath(path: string, remoteCwd: string): string {
+	const normalizedCwd = normalizeRemoteDir(remoteCwd);
+	if (path === normalizedCwd) {
+		return ".";
+	}
+	if (!path.startsWith(`${normalizedCwd}/`)) {
+		throw new Error(
+			`Remote path ${path} is outside the active SSH working directory ${remoteCwd}. Use a relative path or switch SSH mode to that directory.`,
+		);
+	}
+	return path.slice(normalizedCwd.length + 1);
+}
+
+function toLocalEditPath(path: string, remoteCwd: string): string {
+	if (path.startsWith("~/")) {
+		throw new Error("ssh_edit does not expand ~ paths. Use a path relative to the SSH working directory instead.");
+	}
+	if (isAbsolute(path)) {
+		return remoteRelativePath(path, remoteCwd);
+	}
+	return path;
+}
+
+function toRemotePath(path: string, localCwd: string, remoteCwd: string): string {
+	const relativePath = relative(localCwd, path).split(sep).join("/");
+	if (relativePath.startsWith("../") || relativePath === "..") {
+		throw new Error(`Resolved edit path ${path} escaped the local SSH edit workspace.`);
+	}
+	if (!relativePath || relativePath === ".") {
+		return remoteCwd;
+	}
+	return `${normalizeRemoteDir(remoteCwd)}/${relativePath}`;
 }
 
 function parseSshConfigProfiles(): SshProfile[] {
@@ -211,16 +249,17 @@ function createRemoteWriteOps(target: ActiveSshTarget): WriteOperations {
 	};
 }
 
-function createRemoteEditOps(target: ActiveSshTarget): EditOperations {
-	const readOps = createRemoteReadOps(target);
-	const writeOps = createRemoteWriteOps(target);
+function createRemoteEditOps(target: ActiveSshTarget, localCwd: string): EditOperations {
+	const remotePath = (path: string) => toRemotePath(path, localCwd, target.remoteCwd);
 	return {
-		readFile: readOps.readFile,
-		writeFile: writeOps.writeFile,
-		access: (absolutePath) =>
-			sshOk(target.remote, `test -r ${shellQuote(absolutePath)} && test -w ${shellQuote(absolutePath)}`).then(
-				() => {},
-			),
+		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`),
+		writeFile: async (absolutePath, content) => {
+			await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, { stdin: content });
+		},
+		access: (absolutePath) => {
+			const path = remotePath(absolutePath);
+			return sshOk(target.remote, `test -r ${shellQuote(path)} && test -w ${shellQuote(path)}`).then(() => {});
+		},
 	};
 }
 
@@ -303,10 +342,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Read file contents on the active SSH host",
 		promptGuidelines: ["Use ssh_read when the task is on the active SSH host instead of the local machine."],
 		parameters: readBase.parameters,
-		async execute(toolCallId, params, signal, onUpdate) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const tool = createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate);
+			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -327,10 +366,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Create or overwrite files on the active SSH host",
 		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
 		parameters: writeBase.parameters,
-		async execute(toolCallId, params, signal, onUpdate) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const tool = createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate);
+			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -355,10 +394,15 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		],
 		parameters: editBase.parameters,
 		prepareArguments: editBase.prepareArguments,
-		async execute(toolCallId, params, signal, onUpdate) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
-			const tool = createEditToolDefinition(target.remoteCwd, { operations: createRemoteEditOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate);
+			const localCwd = process.cwd();
+			const transformedParams = {
+				...params,
+				path: toLocalEditPath(params.path, target.remoteCwd),
+			};
+			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd) });
+			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -379,10 +423,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Execute bash commands on the active SSH host",
 		promptGuidelines: ["Use ssh_bash when the command must run on the active SSH host rather than locally."],
 		parameters: bashBase.parameters,
-		async execute(toolCallId, params, signal, onUpdate) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const tool = createBashToolDefinition(target.remoteCwd, { operations: createRemoteBashOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate);
+			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme, context) {
 			const command = typeof args?.command === "string" ? args.command : "...";
@@ -404,7 +448,6 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			return filtered.length > 0 ? filtered.map((option) => ({ value: option, label: option })) : null;
 		},
 		handler: async (args, ctx) => {
-			await ctx.waitForIdle();
 			const input = args.trim();
 			const profiles = refreshProfiles();
 
