@@ -1,7 +1,7 @@
 {
   "name": "@ogulcancelik/pi-ssh-tools",
   "version": "0.1.5",
-  "description": "Explicit SSH tools for pi. Toggle /ssh on for a host, then use ssh_read, ssh_write, ssh_edit, and ssh_bash without replacing local tools.",
+  "description": "Explicit SSH tools for pi. Toggle /ssh on for a host, then use ssh_read, ssh_write, ssh_edit, and ssh_bash without replacing local tools. Your own ! and !! commands follow the active host; prefix one with local: to keep it local.",
   "type": "module",
   "keywords": [
     "pi-package",

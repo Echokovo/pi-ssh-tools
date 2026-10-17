@@ -6,6 +6,7 @@ import {
 	type BashOperations,
 	createBashToolDefinition,
 	createEditToolDefinition,
+	createLocalBashOperations,
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	type EditOperations,
@@ -40,6 +41,8 @@ type SshExecOptions = {
 const SSH_STATUS_KEY = "ssh-tools";
 const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"] as const;
 const SSH_CONFIG_PATH = join(homedir(), ".ssh", "config");
+/** Prefix a `!` / `!!` command with this to keep it on the local machine while SSH mode is on. */
+const LOCAL_BASH_MARKER = "local:";
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -273,10 +276,10 @@ function createRemoteEditOps(target: ActiveSshTarget, localCwd: string): EditOpe
 	};
 }
 
-function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
+function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
-			const script = `cd ${shellQuote(cwd)}\n${command}\n`;
+			const script = `cd ${shellQuote(overrideCwd ?? cwd)}\n${command}\n`;
 			const { exitCode } = await sshExec(target.remote, "exec bash -se", {
 				stdin: script,
 				signal,
@@ -285,6 +288,38 @@ function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 				onStderrData: onData,
 			});
 			return { exitCode };
+		},
+	};
+}
+
+/** Split the settings `shellCommandPrefix` pi prepends to `!` / `!!` commands from the command the user typed. */
+function splitSettingsPrefix(command: string, prefix: string | undefined): { prefix: string; body: string } {
+	if (prefix && command.startsWith(`${prefix}\n`)) {
+		return { prefix: `${prefix}\n`, body: command.slice(prefix.length + 1) };
+	}
+	return { prefix: "", body: command };
+}
+
+/**
+ * Operations for user-entered `!` and `!!` commands, used only while SSH mode is on.
+ * They run on the active SSH host, and `local:` forces the local machine.
+ */
+function createUserBashOperations(
+	target: ActiveSshTarget,
+	settings: { shellCommandPrefix?: string; shellPath?: string },
+): BashOperations {
+	const settingsPrefix = settings.shellCommandPrefix || undefined;
+	const remoteOps = createRemoteBashOps(target, target.remoteCwd);
+	const localOps = createLocalBashOperations({ shellPath: settings.shellPath });
+	return {
+		exec: async (command, cwd, options) => {
+			const { prefix, body } = splitSettingsPrefix(command, settingsPrefix);
+			const trimmed = body.replace(/^[ \t]+/, "");
+			if (!trimmed.startsWith(LOCAL_BASH_MARKER)) {
+				return remoteOps.exec(body, cwd, options);
+			}
+			const localCommand = `${prefix}${trimmed.slice(LOCAL_BASH_MARKER.length).replace(/^[ \t]+/, "")}`;
+			return localOps.exec(localCommand, cwd, options);
 		},
 	};
 }
@@ -335,7 +370,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		activeTarget = { name: profile.name, remote: profile.remote, remoteCwd };
 		enableSshTools(pi);
 		updateStatus(ctx);
-		ctx.ui.notify(`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd})`, "info");
+		ctx.ui.notify(
+			`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd}). ! and !! run remotely; prefix a command with local: to run it locally.`,
+			"info",
+		);
 	};
 
 	const deactivate = (ctx: ExtensionCommandContext) => {
@@ -450,6 +488,23 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		renderResult: bashBase.renderResult,
 	});
 
+	// Route user-entered `!` and `!!` commands to the active SSH host. With SSH mode off this handler only points out a stray `local:` marker and returns undefined, so pi executes locally as usual.
+	pi.on("user_bash", (event, ctx) => {
+		if (!activeTarget) {
+			if (event.command.replace(/^[ \t]+/, "").startsWith(LOCAL_BASH_MARKER)) {
+				ctx.ui.notify("SSH mode is off - local: is not needed here and reaches your shell as a command name", "warning");
+			}
+			return undefined;
+		}
+		const settings = (pi.getSettings?.() ?? {}) as Partial<{ shellCommandPrefix: string; shellPath: string }>;
+		return {
+			operations: createUserBashOperations(activeTarget, {
+				shellCommandPrefix: settings.shellCommandPrefix,
+				shellPath: settings.shellPath,
+			}),
+		};
+	});
+
 	pi.registerCommand("ssh", {
 		description: "Toggle remote SSH tools: /ssh, /ssh off, /ssh status, /ssh <host>[:/path]",
 		getArgumentCompletions: (prefix) => {
@@ -514,7 +569,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote working directory: ${activeTarget.remoteCwd}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.`,
+				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote working directory: ${activeTarget.remoteCwd}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.\nBash commands the user runs with ! or !! also execute on the remote host in the remote working directory, unless the command starts with "local:".`,
 		};
 	});
 }
