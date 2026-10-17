@@ -2,6 +2,8 @@
 
 Explicit SSH tools for [pi](https://github.com/earendil-works/pi).
 
+> Standalone, independently maintained fork of `pi-ssh-tools`, originally written by [Can Celik](https://github.com/ogulcancelik) inside the [`pi-extensions`](https://github.com/ogulcancelik/pi-extensions) monorepo. MIT licensed with the original copyright intact — see [License](#license).
+
 Turn SSH mode on only when you need it, keep local tools untouched, and give the agent a separate remote toolset:
 
 - `ssh_read`
@@ -12,14 +14,14 @@ Turn SSH mode on only when you need it, keep local tools untouched, and give the
 ## Install
 
 ```bash
-pi install npm:@ogulcancelik/pi-ssh-tools
+pi install git:github.com/Echokovo/pi-ssh-tools
 ```
 
 Or add manually to `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "packages": ["npm:@ogulcancelik/pi-ssh-tools"]
+  "packages": ["git:github.com/Echokovo/pi-ssh-tools"]
 }
 ```
 
@@ -104,4 +106,11 @@ Two details worth knowing:
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
+
+### Provenance
+
+- Upstream: [`ogulcancelik/pi-extensions`](https://github.com/ogulcancelik/pi-extensions), package `packages/pi-ssh-tools`, published to npm as `@ogulcancelik/pi-ssh-tools` up to `0.1.6`.
+- This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
+- `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
+- Maintained independently from here on. Not an upstream release, and not endorsed by the original author.
