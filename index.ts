@@ -469,10 +469,27 @@ async function resolveRemoteCwd(profile: SshProfile): Promise<string> {
 	return (await sshOk(profile.remote, "pwd")).toString("utf8").trim();
 }
 
+/**
+ * `test -r` reports a missing file with an exit code and not a word, which is how every
+ * unreadable remote file used to arrive as "SSH failed (1): unknown ssh error". Name the
+ * check that failed and the path it failed on, so the model can create the file, fix its
+ * permissions, or correct the path without involving the user.
+ */
+function remoteAccessCheck(path: string, requireWritable: boolean): string {
+	const quoted = shellQuote(path);
+	const report = (reason: string) => shellQuote(`${reason}: ${path}`);
+	return [
+		`if [ ! -e ${quoted} ]; then echo ${report("no such file")} >&2; exit 1; fi`,
+		`if [ ! -f ${quoted} ]; then echo ${report("not a regular file")} >&2; exit 1; fi`,
+		`if [ ! -r ${quoted} ]; then echo ${report("not readable")} >&2; exit 1; fi`,
+		...(requireWritable ? [`if [ ! -w ${quoted} ]; then echo ${report("not writable")} >&2; exit 1; fi`] : []),
+	].join("; ");
+}
+
 function createRemoteReadOps(target: ActiveSshTarget): ReadOperations {
 	return {
 		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`),
-		access: (absolutePath) => sshOk(target.remote, `test -r ${shellQuote(absolutePath)}`).then(() => {}),
+		access: (absolutePath) => sshOk(target.remote, remoteAccessCheck(absolutePath, false)).then(() => {}),
 		detectImageMimeType: async (absolutePath) => inferImageMimeType(absolutePath),
 	};
 }
@@ -495,7 +512,7 @@ function createRemoteEditOps(target: ActiveSshTarget, localCwd: string): EditOpe
 		},
 		access: (absolutePath) => {
 			const path = remotePath(absolutePath);
-			return sshOk(target.remote, `test -r ${shellQuote(path)} && test -w ${shellQuote(path)}`).then(() => {});
+			return sshOk(target.remote, remoteAccessCheck(path, true)).then(() => {});
 		},
 	};
 }
