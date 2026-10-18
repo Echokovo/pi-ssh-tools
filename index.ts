@@ -37,8 +37,8 @@ type SshExecOptions = {
 	onStdoutData?: (data: Buffer) => void;
 	onStderrData?: (data: Buffer) => void;
 	timeoutSeconds?: number;
-	/** Never let ssh ask a question. Used by reachability probes. */
-	nonInteractive?: boolean;
+	/** Shorter ConnectTimeout for probes; every call already refuses to ask. */
+	connectTimeoutSeconds?: number;
 };
 
 const SSH_STATUS_KEY = "ssh-tools";
@@ -91,6 +91,17 @@ const SESSION_HANDOFF_KEY = Symbol.for("pi-ssh-tools:session-handoff");
 
 /** How long a restored workspace waits for the background reachability probe. */
 const PROBE_TIMEOUT_SECONDS = 5;
+
+/**
+ * ssh reports its own failures as 255 and passes the remote command's status
+ * through for everything else, so 255 means "the call never ran".
+ */
+const SSH_TRANSPORT_EXIT_CODE = 255;
+/** A real call gets more room than a probe: the user is waiting on this one. */
+const SSH_CONNECT_TIMEOUT_SECONDS = 10;
+/** Notice a dead link after ~45s instead of on the next write, and keep idle NAT and proxy timers from dropping a healthy one. */
+const SSH_KEEPALIVE_INTERVAL_SECONDS = 15;
+const SSH_KEEPALIVE_COUNT_MAX = 3;
 
 type SshSessionState = {
 	version: number;
@@ -318,15 +329,28 @@ function inferImageMimeType(path: string): string | null {
 	}
 }
 
+/**
+ * Options on every ssh call. BatchMode is not a preference here: ssh reads a
+ * passphrase or a host-key answer from /dev/tty, which is pi's keyboard rather than
+ * the pipe we own, so an interactive host would either take over the TUI or hang on
+ * the OS connect timeout (~2 minutes) before a single remote command ran.
+ */
+function sshBaseOptions(options: SshExecOptions): string[] {
+	return [
+		"-o",
+		"BatchMode=yes",
+		"-o",
+		`ConnectTimeout=${options.connectTimeoutSeconds ?? SSH_CONNECT_TIMEOUT_SECONDS}`,
+		"-o",
+		`ServerAliveInterval=${SSH_KEEPALIVE_INTERVAL_SECONDS}`,
+		"-o",
+		`ServerAliveCountMax=${SSH_KEEPALIVE_COUNT_MAX}`,
+	];
+}
+
 function sshExec(remote: string, command: string, options: SshExecOptions = {}) {
 	return new Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null }>((resolve, reject) => {
-		const args: string[] = [];
-		if (options.nonInteractive) {
-			// ssh reads passphrases and host-key answers from the terminal, not from the
-			// pipe we own, so a probing call that has to ask would steal pi's keyboard.
-			args.push("-o", "BatchMode=yes", "-o", "ConnectTimeout=5");
-		}
-		args.push(remote, command);
+		const args: string[] = [...sshBaseOptions(options), remote, command];
 		const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
@@ -385,6 +409,11 @@ function sshExec(remote: string, command: string, options: SshExecOptions = {}) 
 			}
 		}
 
+		// ssh can exit before it reads stdin - a refused authentication or an unknown host
+		// key does exactly that - and the failed write then emits EPIPE on this socket. An
+		// unhandled 'error' event would take the process down with it, while the real
+		// failure is already reported through the exit code and stderr.
+		child.stdin.on("error", () => {});
 		if (options.stdin !== undefined) {
 			child.stdin.write(options.stdin);
 		}
@@ -392,11 +421,43 @@ function sshExec(remote: string, command: string, options: SshExecOptions = {}) 
 	});
 }
 
+/**
+ * stderr patterns that prove a 255 came from the transport. An unrecognised 255 is
+ * left alone, because a remote command is allowed to exit 255 as well: claiming
+ * otherwise would tell the model to reconnect when its command simply failed.
+ */
+const TRANSPORT_FAILURES: ReadonlyArray<readonly [RegExp, string]> = [
+	[/passphrase required|entered in batch mode|too many authentication failures|permission denied/i, "refused to authenticate (BatchMode is on, so ssh could not ask for a passphrase: add the key to ssh-agent)"],
+	[/host key verification failed|identification has changed|no matching host key|no matching key exchange/i, "rejected the host key"],
+	[/could not resolve hostname|name or service not known|temporary failure in name resolution/i, "did not resolve"],
+	[/connection timed out|operation timed out/i, "did not answer within the connect timeout"],
+	[/connection refused|no route to host|network is unreachable|connection closed by/i, "could not be connected to"],
+	[/connection reset by|broken pipe|timeout, server|client loop exited/i, "dropped"],
+];
+
+/** Why a call never reached the remote shell, or null when stderr says nothing. */
+function sshTransportFailure(stderr: string): string | null {
+	if (!stderr.trim()) {
+		return null;
+	}
+	for (const [pattern, reason] of TRANSPORT_FAILURES) {
+		if (pattern.test(stderr)) {
+			return reason;
+		}
+	}
+	return null;
+}
+
 async function sshOk(remote: string, command: string, options: SshExecOptions = {}): Promise<Buffer> {
 	const { stdout, stderr, exitCode } = await sshExec(remote, command, options);
 	if (exitCode !== 0) {
 		const errorText = stderr.toString("utf8").trim() || stdout.toString("utf8").trim() || "unknown ssh error";
-		throw new Error(`SSH failed (${exitCode}): ${errorText}`);
+		const transport = exitCode === SSH_TRANSPORT_EXIT_CODE ? sshTransportFailure(stderr.toString("utf8")) : null;
+		throw new Error(
+			transport
+				? `SSH to ${remote} ${transport} - the command did not run: ${errorText}`
+				: `SSH failed (${exitCode}): ${errorText}`,
+		);
 	}
 	return stdout;
 }
@@ -443,13 +504,24 @@ function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): Bas
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
 			const script = `cd ${shellQuote(overrideCwd ?? cwd)}\n${command}\n`;
-			const { exitCode } = await sshExec(target.remote, "exec bash -se", {
+			const { exitCode, stderr } = await sshExec(target.remote, "exec bash -se", {
 				stdin: script,
 				signal,
 				timeoutSeconds: timeout,
 				onStdoutData: onData,
 				onStderrData: onData,
 			});
+			// A dropped link would otherwise reach the model as a bare exit 255 that
+			// reads like the command itself failed, so say what actually happened.
+			const transport = exitCode === SSH_TRANSPORT_EXIT_CODE ? sshTransportFailure(stderr.toString("utf8")) : null;
+			if (transport) {
+				onData(
+					Buffer.from(
+						`\n[ssh-tools] SSH to ${target.remote} ${transport} - the command did not run. Reconnect with /ssh ${target.name}.\n`,
+						"utf8",
+					),
+				);
+			}
 			return { exitCode };
 		},
 	};
@@ -602,14 +674,19 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				// The session was replaced under this probe; the new one reports its own state.
 			}
 		};
-		void sshExec(target.remote, "true", { timeoutSeconds: PROBE_TIMEOUT_SECONDS, nonInteractive: true })
+		void sshExec(target.remote, "true", {
+			timeoutSeconds: PROBE_TIMEOUT_SECONDS,
+			connectTimeoutSeconds: PROBE_TIMEOUT_SECONDS,
+		})
 			.then(({ exitCode, stderr }) => {
 				if (token !== probeToken || activeTarget?.remote !== target.remote || exitCode === 0) {
 					return;
 				}
-				const detail = summarizeError(stderr.toString("utf8"));
+				const stderrText = stderr.toString("utf8");
+				const detail = summarizeError(stderrText);
+				const reason = sshTransportFailure(stderrText) ?? `did not answer (exit ${exitCode})`;
 				warn(
-					`SSH workspace ${target.name} (${target.remote}) is restored, but the host did not answer (exit ${exitCode}${detail ? `: ${detail}` : ""}). Run /ssh status.`,
+					`SSH workspace ${target.name} (${target.remote}) is restored, but the host ${reason}${detail ? `: ${detail}` : ""}. Run /ssh status.`,
 				);
 			})
 			.catch((error: unknown) => {

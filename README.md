@@ -124,14 +124,21 @@ Understand what that buys: remote files are then governed by the SSH target you 
 
 - [pi](https://github.com/earendil-works/pi)
 - local `ssh` client available in `$PATH`
-- key-based auth or another non-interactive SSH setup
+- key-based auth: every call runs with `BatchMode=yes`, so ssh is never allowed to ask for a passphrase, a password, or a host-key answer
 - `bash` available on the remote host
+
+Those prompts are read from the terminal, which is pi's keyboard rather than this
+extension's pipe, so an interactive host now fails immediately instead of hanging or
+stealing input. Put the key in `ssh-agent` or set `IdentityFile` in `~/.ssh/config`, and
+accept a new host key once from your own terminal before pointing `/ssh` at it.
 
 ## Notes
 
 - `ssh_write` writes file content over stdin, which behaves better on macOS than GNU-specific `base64 -d` shell snippets
 - relative remote paths resolve against the active remote cwd
 - image reads are supported for common extensions: jpg, jpeg, png, gif, webp
+- every `ssh` call also sets `ConnectTimeout=10`, `ServerAliveInterval=15`, and `ServerAliveCountMax=3`: an unreachable host fails in seconds instead of waiting on the OS TCP timeout, and a link that dies mid-session is noticed after ~45s
+- exit code 255 is ssh's own failure code, so it is reported as a transport failure (`SSH to mac did not resolve - the command did not run`) rather than as a command that failed; an unrecognised 255 is left alone, because a remote command is allowed to exit 255 too
 
 ## License
 
@@ -143,5 +150,5 @@ MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
 - This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
 - `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
 - `0.2.1` adds the optional `@gotgenes/pi-permission-system` integration described above, so remote paths stop being judged as local ones.
-- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else.
+- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else. It also puts `BatchMode`, `ConnectTimeout`, and keepalive options on every `ssh` call, reports exit 255 as a transport failure instead of a failed command, and stops a broken stdin pipe from taking the process down when ssh exits before reading it.
 - Maintained independently from here on. Not an upstream release, and not endorsed by the original author.
