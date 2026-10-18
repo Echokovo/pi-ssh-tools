@@ -29,6 +29,8 @@ type ActiveSshTarget = {
 	name: string;
 	remote: string;
 	remoteCwd: string;
+	/** The remote home query, filled the first time a `~` path needs it. */
+	remoteHome?: Promise<string>;
 };
 
 type SshExecOptions = {
@@ -232,10 +234,53 @@ function remoteRelativePath(path: string, remoteCwd: string): string {
 	return path.slice(normalizedCwd.length + 1);
 }
 
-function toLocalEditPath(path: string, remoteCwd: string): string {
-	if (path.startsWith("~/")) {
-		throw new Error("ssh_edit does not expand ~ paths. Use a path relative to the SSH working directory instead.");
+/**
+ * The remote user's home directory: asked once per target, and only when a path
+ * actually starts with `~`, so the common call costs no extra round trip.
+ */
+function remoteHomeDir(target: ActiveSshTarget): Promise<string> {
+	if (!target.remoteHome) {
+		target.remoteHome = sshOk(target.remote, 'printf %s "$HOME"')
+			.then((value) => {
+				const home = value.toString("utf8").trim();
+				if (!home.startsWith("/")) {
+					throw new Error(`Could not determine the home directory on ${target.remote}. Use a path relative to ${target.remoteCwd}.`);
+				}
+				return normalizeRemoteDir(home);
+			})
+			.catch((error: unknown) => {
+				// A cached rejection would outlive the outage; let a later call ask again.
+				target.remoteHome = undefined;
+				throw error;
+			});
 	}
+	return target.remoteHome;
+}
+
+/**
+ * `~` is the one path form pi cannot carry over: normalizePath() expands it against the
+ * LOCAL home before the operations layer ever sees the path, so `~/notes.md` reached the
+ * remote host as `/home/<you>/notes.md` - right only when both machines happened to
+ * agree, and ssh_write would even mkdir it. Expanding it here makes `~` mean the remote
+ * home, the way a `!` command on the same host already reads it. Relative and absolute
+ * paths are left to pi's own resolution, so they behave exactly like the built-in
+ * read/write/edit. `~user` is refused rather than guessed: pi turns it into a literal
+ * `~user` directory.
+ */
+async function expandRemoteTilde(toolName: string, path: string, target: ActiveSshTarget): Promise<string> {
+	if (typeof path !== "string" || !path.startsWith("~")) {
+		return path;
+	}
+	if (path === "~") {
+		return remoteHomeDir(target);
+	}
+	if (path.startsWith("~/")) {
+		return `${await remoteHomeDir(target)}/${path.slice(2)}`;
+	}
+	throw new Error(`${toolName} does not expand ~user paths. Use ~ or a path relative to ${target.remoteCwd}.`);
+}
+
+function toLocalEditPath(path: string, remoteCwd: string): string {
 	if (isAbsolute(path)) {
 		return remoteRelativePath(path, remoteCwd);
 	}
@@ -746,14 +791,15 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_read",
 		label: "ssh_read",
-		description: "Read a file on the active SSH host. Relative paths are resolved against the active remote working directory.",
+		description: "Read a file on the active SSH host. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
 		promptSnippet: "Read file contents on the active SSH host",
 		promptGuidelines: ["Use ssh_read when the task is on the active SSH host instead of the local machine."],
 		parameters: readBase.parameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
+			const path = await expandRemoteTilde("ssh_read", params.path, target);
 			const tool = createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, withCwd(ctx, target.remoteCwd));
+			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -770,14 +816,15 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_write",
 		label: "ssh_write",
-		description: "Write a text file on the active SSH host. Relative paths are resolved against the active remote working directory.",
+		description: "Write a text file on the active SSH host. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
 		promptSnippet: "Create or overwrite files on the active SSH host",
 		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
 		parameters: writeBase.parameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
+			const path = await expandRemoteTilde("ssh_write", params.path, target);
 			const tool = createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, withCwd(ctx, target.remoteCwd));
+			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -794,7 +841,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_edit",
 		label: "ssh_edit",
-		description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory.",
+		description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
 		promptSnippet: "Make precise file edits on the active SSH host",
 		promptGuidelines: [
 			"Use ssh_edit for precise remote changes.",
@@ -807,7 +854,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			const localCwd = process.cwd();
 			const transformedParams = {
 				...params,
-				path: toLocalEditPath(params.path, target.remoteCwd),
+				path: toLocalEditPath(await expandRemoteTilde("ssh_edit", params.path, target), target.remoteCwd),
 			};
 			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd) });
 			return tool.execute(toolCallId, transformedParams, signal, onUpdate, withCwd(ctx, localCwd));
