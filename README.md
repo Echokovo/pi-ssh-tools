@@ -126,4 +126,5 @@ MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
 - Upstream: [`ogulcancelik/pi-extensions`](https://github.com/ogulcancelik/pi-extensions), package `packages/pi-ssh-tools`, published to npm as `@ogulcancelik/pi-ssh-tools` up to `0.1.6`.
 - This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
 - `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
+- `0.2.1` adds the optional `@gotgenes/pi-permission-system` integration described above, so remote paths stop being judged as local ones.
 - Maintained independently from here on. Not an upstream release, and not endorsed by the original author.
