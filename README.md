@@ -120,6 +120,23 @@ The integration is optional, discovered at runtime through that package's proces
 
 Understand what that buys: remote files are then governed by the SSH target you picked, not by rules written for local paths. That is the only honest boundary here, since `ssh_bash` can already reach any path on the active host.
 
+## Debugging
+
+```bash
+PI_SSH_TOOLS_DEBUG=1 pi
+```
+
+Every `ssh` call then appends one line to `pi-ssh-tools.log` in your temp directory
+(`/tmp/pi-ssh-tools.log` on Linux):
+
+```
+2026-10-18T14:31:52.002Z mac exit=1 1ms cmd="if [ ! -e '/Users/lin/notes.md' ]; ..." stderr="no such file: /Users/lin/notes.md"
+```
+
+That is the whole call — host, exit code, duration, the command that ran, and what ssh
+said — including the background probes and calls that never reached a tool. File content
+is never written to it. Unset the variable and nothing is logged.
+
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi)
@@ -151,5 +168,5 @@ MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
 - This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
 - `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
 - `0.2.1` adds the optional `@gotgenes/pi-permission-system` integration described above, so remote paths stop being judged as local ones.
-- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else. It also puts `BatchMode`, `ConnectTimeout`, and keepalive options on every `ssh` call, reports exit 255 as a transport failure instead of a failed command, and stops a broken stdin pipe from taking the process down when ssh exits before reading it. A path starting with `~` now means the remote home instead of being silently rewritten to your local one, a remote file that cannot be read names the reason it cannot.
+- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else. It also puts `BatchMode`, `ConnectTimeout`, and keepalive options on every `ssh` call, reports exit 255 as a transport failure instead of a failed command, and stops a broken stdin pipe from taking the process down when ssh exits before reading it. A path starting with `~` now means the remote home instead of being silently rewritten to your local one, a remote file that cannot be read names the reason it cannot, and `PI_SSH_TOOLS_DEBUG=1` logs every call.
 - Maintained independently from here on. Not an upstream release, and not endorsed by the original author.

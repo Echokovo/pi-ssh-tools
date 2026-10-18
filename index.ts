@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, sep } from "node:path";
 import {
 	type BashOperations,
@@ -104,6 +104,31 @@ const SSH_CONNECT_TIMEOUT_SECONDS = 10;
 /** Notice a dead link after ~45s instead of on the next write, and keep idle NAT and proxy timers from dropping a healthy one. */
 const SSH_KEEPALIVE_INTERVAL_SECONDS = 15;
 const SSH_KEEPALIVE_COUNT_MAX = 3;
+
+/**
+ * Opt-in call log: `PI_SSH_TOOLS_DEBUG=1 pi`. The tool error is what the model sees and
+ * it is deliberately short; this file is what a human reads when a call makes no sense.
+ * Remote command text and stderr go in, file content never does.
+ */
+const DEBUG_LOG_PATH = process.env.PI_SSH_TOOLS_DEBUG ? join(tmpdir(), "pi-ssh-tools.log") : null;
+
+function logSshCall(entry: string): void {
+	if (!DEBUG_LOG_PATH) {
+		return;
+	}
+	try {
+		appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} ${entry}\n`, "utf8");
+	} catch {
+		// A log that cannot be written must not break the call it describes.
+	}
+}
+
+/** One line per call: what ran, how it ended, what ssh said. Never the file content. */
+function describeSshCall(remote: string, command: string, exitCode: number | null, ms: number, stderr: Buffer): string {
+	const summary = (value: string, limit: number) => JSON.stringify(value.length > limit ? `${value.slice(0, limit)}...` : value);
+	const errorText = stderr.toString("utf8").trim();
+	return `${remote} exit=${exitCode} ${ms}ms cmd=${summary(command, 160)}${errorText ? ` stderr=${summary(errorText, 300)}` : ""}`;
+}
 
 type SshSessionState = {
 	version: number;
@@ -396,6 +421,7 @@ function sshBaseOptions(options: SshExecOptions): string[] {
 function sshExec(remote: string, command: string, options: SshExecOptions = {}) {
 	return new Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null }>((resolve, reject) => {
 		const args: string[] = [...sshBaseOptions(options), remote, command];
+		const startedAt = Date.now();
 		const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
@@ -426,10 +452,12 @@ function sshExec(remote: string, command: string, options: SshExecOptions = {}) 
 			options.onStderrData?.(data);
 		});
 		child.on("error", (error) => {
+			logSshCall(`${remote} could not start: ${error.message}`);
 			cleanup();
 			reject(error);
 		});
 		child.on("close", (exitCode) => {
+			logSshCall(describeSshCall(remote, command, exitCode, Date.now() - startedAt, Buffer.concat(stderrChunks)));
 			cleanup();
 			if (options.signal?.aborted) {
 				reject(new Error("aborted"));
