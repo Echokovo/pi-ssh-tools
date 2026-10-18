@@ -14,6 +14,7 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	type ReadOperations,
+	type SessionEntry,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -36,6 +37,8 @@ type SshExecOptions = {
 	onStdoutData?: (data: Buffer) => void;
 	onStderrData?: (data: Buffer) => void;
 	timeoutSeconds?: number;
+	/** Never let ssh ask a question. Used by reachability probes. */
+	nonInteractive?: boolean;
 };
 
 const SSH_STATUS_KEY = "ssh-tools";
@@ -70,6 +73,132 @@ const PERMISSION_GATE_NOTES: Record<PermissionGateState, string> = {
 const SSH_CONFIG_PATH = join(homedir(), ".ssh", "config");
 /** Prefix a `!` / `!!` command with this to keep it on the local machine while SSH mode is on. */
 const LOCAL_BASH_MARKER = "local:";
+
+/**
+ * Session entry type carrying the SSH workspace across /new, /fork, /clone, and /resume.
+ * Plain custom entries are not sent to the model, so this is extension state only.
+ */
+const SESSION_STATE_ENTRY_TYPE = "pi-ssh-tools:target";
+const SESSION_STATE_VERSION = 1;
+
+/**
+ * Handoff slot for the session generations whose file does not carry our entry yet.
+ * pi keeps one process across a session replacement, and /reload re-imports this module
+ * (it clears the extension module cache), so module-level state cannot be the carrier -
+ * globalThis can.
+ */
+const SESSION_HANDOFF_KEY = Symbol.for("pi-ssh-tools:session-handoff");
+
+/** How long a restored workspace waits for the background reachability probe. */
+const PROBE_TIMEOUT_SECONDS = 5;
+
+type SshSessionState = {
+	version: number;
+	active: boolean;
+	name: string;
+	remote: string;
+	remoteCwd: string;
+};
+
+/** Where the currently applied workspace came from. */
+type StateOrigin = "none" | "session" | "handoff" | "manual";
+
+const STATE_ORIGIN_NOTES: Record<StateOrigin, string> = {
+	none: "started in this session",
+	session: "restored from this session file",
+	handoff: "inherited from the previous session",
+	manual: "selected in this session",
+};
+
+/** Keyed by cwd so one process serving several cwds does not mix workspaces. */
+type SshHandoffStore = Record<string, SshSessionState | null>;
+
+function sshHandoffStore(): SshHandoffStore {
+	const host = globalThis as unknown as Record<symbol, SshHandoffStore | undefined>;
+	let store = host[SESSION_HANDOFF_KEY];
+	if (!store) {
+		store = {};
+		host[SESSION_HANDOFF_KEY] = store;
+	}
+	return store;
+}
+
+function readHandoff(cwd: string): SshSessionState | null {
+	return sshHandoffStore()[cwd] ?? null;
+}
+
+function writeHandoff(cwd: string, state: SshSessionState | null): void {
+	sshHandoffStore()[cwd] = state;
+}
+
+/** Session files outlive package versions and are user-editable: validate, never trust. */
+function toSshSessionState(value: unknown): SshSessionState | null {
+	if (typeof value !== "object" || value === null) {
+		return null;
+	}
+	const record = value as Record<string, unknown>;
+	if (record.version !== SESSION_STATE_VERSION) {
+		return null;
+	}
+	if (typeof record.active !== "boolean") {
+		return null;
+	}
+	if (typeof record.name !== "string" || !record.name) {
+		return null;
+	}
+	if (typeof record.remote !== "string" || !record.remote) {
+		return null;
+	}
+	if (typeof record.remoteCwd !== "string" || !record.remoteCwd) {
+		return null;
+	}
+	return {
+		version: SESSION_STATE_VERSION,
+		active: record.active,
+		name: record.name,
+		remote: record.remote,
+		remoteCwd: record.remoteCwd,
+	};
+}
+
+/** Newest recorded workspace on the path from the session root to the current leaf. */
+function findSessionState(entries: readonly SessionEntry[]): SshSessionState | null {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.type !== "custom" || entry.customType !== SESSION_STATE_ENTRY_TYPE) {
+			continue;
+		}
+		const state = toSshSessionState(entry.data);
+		if (state) {
+			return state;
+		}
+	}
+	return null;
+}
+
+function sameSessionState(left: SshSessionState | null, right: SshSessionState | null): boolean {
+	if (!left || !right) {
+		return left === right;
+	}
+	return (
+		left.active === right.active &&
+		left.name === right.name &&
+		left.remote === right.remote &&
+		left.remoteCwd === right.remoteCwd
+	);
+}
+
+/** First non-empty line, shortened: turns ssh stderr or an Error into one notify line. */
+function summarizeError(value: unknown, max = 160): string {
+	const line = String((value as Error)?.message ?? value ?? "")
+		.split("\n")
+		.find((candidate) => candidate.trim())
+		?.trim();
+	if (!line) {
+		return "";
+	}
+	return line.length > max ? `${line.slice(0, max - 3)}...` : line;
+}
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -191,7 +320,14 @@ function inferImageMimeType(path: string): string | null {
 
 function sshExec(remote: string, command: string, options: SshExecOptions = {}) {
 	return new Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null }>((resolve, reject) => {
-		const child = spawn("ssh", [remote, command], { stdio: ["pipe", "pipe", "pipe"] });
+		const args: string[] = [];
+		if (options.nonInteractive) {
+			// ssh reads passphrases and host-key answers from the terminal, not from the
+			// pipe we own, so a probing call that has to ask would steal pi's keyboard.
+			args.push("-o", "BatchMode=yes", "-o", "ConnectTimeout=5");
+		}
+		args.push(remote, command);
+		const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let timedOut = false;
@@ -367,6 +503,16 @@ function disableSshTools(pi: ExtensionAPI) {
 export default function sshToolsExtension(pi: ExtensionAPI) {
 	let activeTarget: ActiveSshTarget | null = null;
 
+	/** Kept after /ssh off so the recorded state still names a host to reconnect to. */
+	let lastTarget: ActiveSshTarget | null = null;
+	/** Last state written to the session file, so unchanged state is not appended twice. */
+	let lastPersistedState: SshSessionState | null = null;
+	/** What the session branch recorded last time we looked, so /tree only reacts to changes. */
+	let lastRecordedState: SshSessionState | null = null;
+	let stateOrigin: StateOrigin = "none";
+	/** Bumped whenever the target changes, so a stale background probe stays quiet. */
+	let probeToken = 0;
+
 	const readBase = createReadToolDefinition("/");
 	const writeBase = createWriteToolDefinition("/");
 	const editBase = createEditToolDefinition("/");
@@ -392,11 +538,101 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		);
 	};
 
+	// One entry per change keeps the newest copy next to the leaf: /resume reads the
+	// newest match back, /fork and /clone copy the whole branch, and a crash before
+	// session_shutdown cannot lose the workspace. No entry renderer is registered, so
+	// the transcript stays clean and only /tree shows the raw custom type.
+	const snapshotState = (): SshSessionState | null => {
+		const target = activeTarget ?? lastTarget;
+		if (!target) {
+			return null;
+		}
+		return {
+			version: SESSION_STATE_VERSION,
+			active: activeTarget !== null,
+			name: target.name,
+			remote: target.remote,
+			remoteCwd: target.remoteCwd,
+		};
+	};
+
+	const persistState = () => {
+		const state = snapshotState();
+		if (!state || sameSessionState(lastPersistedState, state)) {
+			return;
+		}
+		try {
+			pi.appendEntry(SESSION_STATE_ENTRY_TYPE, state);
+			lastPersistedState = state;
+			lastRecordedState = state;
+		} catch (error) {
+			console.warn("[pi-ssh-tools] could not record the SSH workspace in this session:", error);
+		}
+	};
+
+	/** Apply a recorded workspace. Returns whether SSH mode ended up active. */
+	const applyState = (state: SshSessionState, origin: StateOrigin): boolean => {
+		const target: ActiveSshTarget = {
+			name: state.name,
+			remote: state.remote,
+			remoteCwd: state.remoteCwd,
+		};
+		lastTarget = target;
+		stateOrigin = origin;
+		if (!state.active) {
+			activeTarget = null;
+			probeToken += 1;
+			disableSshTools(pi);
+			return false;
+		}
+		activeTarget = target;
+		enableSshTools(pi);
+		return true;
+	};
+
+	// Reachability is checked after the session is up: pi awaits session_start, and an
+	// unreachable host must not delay or block startup. The workspace stays restored -
+	// this only explains why the next ssh_* call may fail.
+	const probeWorkspace = (target: ActiveSshTarget, ctx: ExtensionContext) => {
+		const token = ++probeToken;
+		const warn = (message: string) => {
+			try {
+				ctx.ui.notify(message, "warning");
+			} catch {
+				// The session was replaced under this probe; the new one reports its own state.
+			}
+		};
+		void sshExec(target.remote, "true", { timeoutSeconds: PROBE_TIMEOUT_SECONDS, nonInteractive: true })
+			.then(({ exitCode, stderr }) => {
+				if (token !== probeToken || activeTarget?.remote !== target.remote || exitCode === 0) {
+					return;
+				}
+				const detail = summarizeError(stderr.toString("utf8"));
+				warn(
+					`SSH workspace ${target.name} (${target.remote}) is restored, but the host did not answer (exit ${exitCode}${detail ? `: ${detail}` : ""}). Run /ssh status.`,
+				);
+			})
+			.catch((error: unknown) => {
+				if (token !== probeToken || activeTarget?.remote !== target.remote) {
+					return;
+				}
+				const message = summarizeError(error);
+				const reason = message.startsWith("timeout:")
+					? `no answer within ${PROBE_TIMEOUT_SECONDS}s`
+					: message || "unknown error";
+				warn(`SSH workspace ${target.name} (${target.remote}) is restored, but the host is not reachable (${reason}). Run /ssh status.`);
+			});
+	};
+
 	const activate = async (profile: SshProfile, ctx: ExtensionCommandContext) => {
 		const remoteCwd = await resolveRemoteCwd(profile);
 		activeTarget = { name: profile.name, remote: profile.remote, remoteCwd };
+		lastTarget = activeTarget;
+		stateOrigin = "manual";
+		probeToken += 1;
 		enableSshTools(pi);
 		updateStatus(ctx);
+		persistState();
 		ctx.ui.notify(
 			`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd}). ! and !! run remotely; prefix a command with local: to run it locally.`,
 			"info",
@@ -405,8 +641,11 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 
 	const deactivate = (ctx: ExtensionCommandContext) => {
 		activeTarget = null;
+		stateOrigin = "manual";
+		probeToken += 1;
 		disableSshTools(pi);
 		updateStatus(ctx);
+		persistState();
 		ctx.ui.notify("SSH mode off", "info");
 	};
 
@@ -549,7 +788,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(`SSH mode is off. ${gateNote}.`, "info");
 					return;
 				}
-				ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd}). ${gateNote}.`, "info");
+				ctx.ui.notify(
+					`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd}) - ${STATE_ORIGIN_NOTES[stateOrigin]}. ${gateNote}.`,
+					"info",
+				);
 				return;
 			}
 
@@ -584,10 +826,79 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		// /fork and /clone copy the whole branch, so their entries already carry the
+		// workspace and /resume reads the historical file; only /new and /reload start
+		// from an empty branch and fall back to the in-process handoff slot.
+		const recorded = findSessionState(ctx.sessionManager.getBranch());
+		const inherited =
+			recorded ??
+			(event.reason === "new" || event.reason === "reload" || event.reason === "fork"
+				? readHandoff(ctx.cwd)
+				: null);
+
+		if (!inherited) {
+			activeTarget = null;
+			lastTarget = null;
+			lastPersistedState = null;
+			lastRecordedState = null;
+			stateOrigin = "none";
+			disableSshTools(pi);
+			updateStatus(ctx);
+			return;
+		}
+
+		// Already on this branch (fork, clone, resume) means nothing to write; otherwise
+		// the restored workspace lands in this session's own file right away.
+		lastPersistedState = recorded ? inherited : null;
+		lastRecordedState = recorded;
+		const active = applyState(inherited, recorded ? "session" : "handoff");
+		updateStatus(ctx);
+		persistState();
+
+		if (!active) {
+			// The user turned SSH off on purpose; a later session must not resurrect it.
+			ctx.ui.notify(
+				`SSH mode stays off (${inherited.name}:${inherited.remoteCwd}) - /ssh ${inherited.name} reconnects`,
+				"info",
+			);
+			return;
+		}
+		ctx.ui.notify(
+			`SSH mode restored: ${inherited.name} (${inherited.remoteCwd}) - ${STATE_ORIGIN_NOTES[recorded ? "session" : "handoff"]}. ! and !! run remotely; prefix a command with local: to run it locally.`,
+			"info",
+		);
+		probeWorkspace({ name: inherited.name, remote: inherited.remote, remoteCwd: inherited.remoteCwd }, ctx);
+	});
+
+	// /tree moves the leaf, and with it the newest recorded workspace. Nothing is
+	// written here: the entry found on this branch already is the record for it.
+	pi.on("session_tree", async (_event, ctx) => {
+		const recorded = findSessionState(ctx.sessionManager.getBranch());
+		// Compare against what this branch recorded the last time we looked. The live
+		// snapshot cannot answer "did anything change?" here: after /ssh off it still
+		// names the last host, so walking around a session that never used SSH would
+		// notify on every single /tree move.
+		if (sameSessionState(lastRecordedState, recorded)) {
+			return;
+		}
+		const wasActive = Boolean(activeTarget);
+		lastRecordedState = recorded;
+		lastPersistedState = recorded;
+		if (recorded?.active) {
+			applyState(recorded, "session");
+			updateStatus(ctx);
+			ctx.ui.notify(`SSH mode follows the session tree: ${recorded.name} (${recorded.remoteCwd})`, "info");
+			probeWorkspace({ name: recorded.name, remote: recorded.remote, remoteCwd: recorded.remoteCwd }, ctx);
+			return;
+		}
 		activeTarget = null;
+		stateOrigin = "none";
+		probeToken += 1;
 		disableSshTools(pi);
 		updateStatus(ctx);
+		const reason = recorded ? `${recorded.name} is not connected at this point` : "the selected point has no SSH workspace";
+		ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${reason}`, "info");
 	});
 
 	pi.on("before_agent_start", async (event) => {
@@ -659,7 +970,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		registerPathBlindExtractors(sessionId);
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event, ctx) => {
 		// The next session generation gets a fresh service whose registries are
 		// empty, so release this node's registrations and arm the attempt again.
 		for (const dispose of extractorDisposers.values()) {
@@ -668,5 +979,12 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		extractorDisposers.clear();
 		integrationAttempted = false;
 		permissionGateState = "pending";
+
+		// /new, /fork, and /reload can start from a file that does not carry our entry, so
+		// hand the workspace to the next session in this process. /resume must not: the
+		// historical session's own record decides there. Quitting must not either - a new
+		// pi process starts with an empty slot, which keeps SSH mode off after a restart.
+		const carry = event.reason === "new" || event.reason === "fork" || event.reason === "reload";
+		writeHandoff(ctx.cwd, carry ? snapshotState() : null);
 	});
 }

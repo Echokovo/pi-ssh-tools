@@ -30,7 +30,7 @@ Or add manually to `~/.pi/agent/settings.json`:
 This package adds a `/ssh` command.
 
 - Default is off
-- No persistence across sessions
+- SSH mode follows the session: `/resume`, `/fork`, `/clone`, `/new`, and `/tree` bring the workspace back or drop it with the session
 - Local `read`, `write`, `edit`, and `bash` stay local
 - When SSH mode is active, the agent also gets `ssh_read`, `ssh_write`, `ssh_edit`, and `ssh_bash`
 - The active remote host and cwd are injected into the system prompt while SSH mode is on
@@ -91,6 +91,22 @@ Two details worth knowing:
 - `shellCommandPrefix` from settings is dropped for remote commands, because it usually sources local shell setup such as `~/.bash_aliases`. It still applies to `local:` commands.
 - Remote commands run in a non-interactive shell, exactly like `ssh_bash`. Full-screen programs such as `vim` or `htop` are not supported.
 
+## SSH mode follows the session
+
+Connecting records the host and the remote cwd into the session, so the workspace travels with it:
+
+- `/resume`, `/fork`, and `/clone` come back with the same host and remote cwd
+- `/new` and `/reload` inherit the workspace from the session you were just in
+- `/tree` follows the point you move to — a point before the connect has no SSH mode
+- `/ssh off` is recorded too, so a later session does not resurrect a workspace you closed on purpose
+- a fresh session with no history starts off and writes nothing
+
+`/ssh status` names where the current workspace came from: this session, the session file, or the previous session.
+
+Restoring runs a background reachability probe. If the host does not answer, you get a warning pointing at `/ssh status`; SSH mode stays on, because the host may simply be down for a moment and reconnecting is one `/ssh <host>` away.
+
+What does not travel: there is no live connection to hand over, and a command that was mid-flight when the session ended is not resumed. Recovery is a fresh SSH connection, which is all this package ever used.
+
 ## Integration with pi-permission-system
 
 [`@gotgenes/pi-permission-system`](https://www.npmjs.com/package/@gotgenes/pi-permission-system) gates tool calls by path. For extension tools it extracts `input.path` by convention and resolves it against the **local** filesystem, which is wrong for `ssh_read`, `ssh_write`, and `ssh_edit`: those paths are remote. A remote `/etc/nginx/nginx.conf` raises an `external_directory` ask, and a remote `.env` matches a local `*.env` deny rule.
@@ -127,4 +143,5 @@ MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
 - This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
 - `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
 - `0.2.1` adds the optional `@gotgenes/pi-permission-system` integration described above, so remote paths stop being judged as local ones.
+- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else.
 - Maintained independently from here on. Not an upstream release, and not endorsed by the original author.
