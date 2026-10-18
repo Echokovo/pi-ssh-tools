@@ -91,6 +91,19 @@ Two details worth knowing:
 - `shellCommandPrefix` from settings is dropped for remote commands, because it usually sources local shell setup such as `~/.bash_aliases`. It still applies to `local:` commands.
 - Remote commands run in a non-interactive shell, exactly like `ssh_bash`. Full-screen programs such as `vim` or `htop` are not supported.
 
+## Integration with pi-permission-system
+
+[`@gotgenes/pi-permission-system`](https://www.npmjs.com/package/@gotgenes/pi-permission-system) gates tool calls by path. For extension tools it extracts `input.path` by convention and resolves it against the **local** filesystem, which is wrong for `ssh_read`, `ssh_write`, and `ssh_edit`: those paths are remote. A remote `/etc/nginx/nginx.conf` raises an `external_directory` ask, and a remote `.env` matches a local `*.env` deny rule.
+
+When that package is loaded, this package registers an extractor for those three tools that declines to report a path. Both path gates then skip them, and the per-tool rule (`permission` in its config) decides on the tool name alone. `ssh_bash` needs nothing: its input carries `command`, not `path`.
+
+The integration is optional, discovered at runtime through that package's process-global service slot (`Symbol.for("@gotgenes/pi-permission-system:session-services")`), so there is no dependency to install and nothing to configure. `/ssh status` reports which way it landed:
+
+- `remote paths are exempt from the local path gates`
+- `permission-system service not found - remote paths are still judged as local paths`
+
+Understand what that buys: remote files are then governed by the SSH target you picked, not by rules written for local paths. That is the only honest boundary here, since `ssh_bash` can already reach any path on the active host.
+
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi)

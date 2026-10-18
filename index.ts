@@ -40,6 +40,33 @@ type SshExecOptions = {
 
 const SSH_STATUS_KEY = "ssh-tools";
 const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"] as const;
+
+/** How the optional pi-permission-system integration ended up for this session. */
+type PermissionGateState = "pending" | "registered" | "missing";
+
+/** The one call pi-ssh-tools needs from a pi-permission-system service: declare a tool's access intent. */
+type PermissionPathGateRegistrar = {
+	registerToolAccessExtractor?: (
+		toolName: string,
+		extractor: (input: Record<string, unknown>) => string | undefined,
+	) => () => void;
+};
+
+/**
+ * The process-global slot pi-permission-system publishes each node's service into.
+ * Read directly instead of `import("@gotgenes/pi-permission-system")`, which cannot
+ * resolve from a git-installed package: its directory tree holds no node_modules.
+ */
+const PERMISSION_SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services");
+
+/** The ssh tools whose `path` names a REMOTE file and must stay invisible to local path gates. */
+const PATH_GATED_SSH_TOOLS = ["ssh_read", "ssh_write", "ssh_edit"];
+
+const PERMISSION_GATE_NOTES: Record<PermissionGateState, string> = {
+	pending: "permission-system integration still pending",
+	registered: "remote paths are exempt from the local path gates",
+	missing: "permission-system service not found - remote paths are still judged as local paths",
+};
 const SSH_CONFIG_PATH = join(homedir(), ".ssh", "config");
 /** Prefix a `!` / `!!` command with this to keep it on the local machine while SSH mode is on. */
 const LOCAL_BASH_MARKER = "local:";
@@ -517,11 +544,12 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			const profiles = refreshProfiles();
 
 			if (input === "status") {
+				const gateNote = PERMISSION_GATE_NOTES[permissionGateState];
 				if (!activeTarget) {
-					ctx.ui.notify("SSH mode is off", "info");
+					ctx.ui.notify(`SSH mode is off. ${gateNote}.`, "info");
 					return;
 				}
-				ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd})`, "info");
+				ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd}). ${gateNote}.`, "info");
 				return;
 			}
 
@@ -571,5 +599,74 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				event.systemPrompt +
 				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote working directory: ${activeTarget.remoteCwd}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.\nBash commands the user runs with ! or !! also execute on the remote host in the remote working directory, unless the command starts with "local:".`,
 		};
+	});
+
+	// ── pi-permission-system integration ─────────────────────────────────────
+	// ssh_* paths are REMOTE paths, but pi-permission-system extracts `input.path`
+	// from every extension tool by convention and judges it against the LOCAL
+	// filesystem: a remote /etc/nginx/nginx.conf raises an external_directory ask,
+	// and a remote .env hits a local `path` deny rule. Registering an extractor
+	// that declines (returns undefined) makes both path gates see no path fact and
+	// skip these tools entirely; the per-tool gate then decides on the tool name.
+	// ssh_bash needs none: its input carries `command`, not `path`.
+	// Remote access stays governed by the SSH target the user picked, not by
+	// rules written for local files - and ssh_bash can already reach any remote
+	// path, so a local path rule here would only be a false guarantee.
+	let permissionGateState: PermissionGateState = "pending";
+	let integrationAttempted = false;
+	const extractorDisposers = new Map<string, () => void>();
+
+	const registerPathBlindExtractors = (sessionId: string) => {
+		// Set before any work: `permissions:ready` fires at least twice per node
+		// (session_start, then the first before_agent_start) and a second
+		// registration for the same tool name throws.
+		integrationAttempted = true;
+		const services = (globalThis as Record<symbol, unknown>)[PERMISSION_SERVICES_KEY] as Map<string, PermissionPathGateRegistrar> | undefined;
+		const permissions = services?.get(sessionId);
+		if (typeof permissions?.registerToolAccessExtractor !== "function") {
+			permissionGateState = "missing";
+			console.warn("[pi-ssh-tools] pi-permission-system published no service for this session, so its local path gates will keep judging remote paths.");
+			return;
+		}
+		let registered = 0;
+		for (const toolName of PATH_GATED_SSH_TOOLS) {
+			try {
+				const dispose = permissions.registerToolAccessExtractor(toolName, () => undefined);
+				if (typeof dispose === "function") extractorDisposers.set(toolName, dispose);
+				registered += 1;
+			} catch (error) {
+				// A duplicate means an earlier broadcast already landed a declining
+				// extractor: same outcome, so count it as registered.
+				if (String((error as Error)?.message ?? "").includes("already registered")) {
+					registered += 1;
+				} else {
+					console.warn(`[pi-ssh-tools] could not register a declining path extractor for ${toolName}:`, error);
+				}
+			}
+		}
+		permissionGateState = registered > 0 ? "registered" : "missing";
+	};
+
+	// pi releases every tracked event-bus subscription when it invalidates this
+	// runtime (session replacement or reload), so the subscription is not stored:
+	// resetting the state below is enough to re-register on a fresh service.
+	pi.events.on("permissions:ready", (data) => {
+		if (integrationAttempted) return;
+		const sessionId = (data as { sessionId?: string | null } | undefined)?.sessionId;
+		// A null session id means the node published no keyed service; a later
+		// broadcast may carry one, so do not mark the attempt as spent.
+		if (!sessionId) return;
+		registerPathBlindExtractors(sessionId);
+	});
+
+	pi.on("session_shutdown", () => {
+		// The next session generation gets a fresh service whose registries are
+		// empty, so release this node's registrations and arm the attempt again.
+		for (const dispose of extractorDisposers.values()) {
+			dispose();
+		}
+		extractorDisposers.clear();
+		integrationAttempted = false;
+		permissionGateState = "pending";
 	});
 }
