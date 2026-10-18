@@ -103,6 +103,17 @@ Connecting records the host and the remote cwd into the session, so the workspac
 
 `/ssh status` names where the current workspace came from: this session, the session file, or the previous session.
 
+A restored workspace is announced above the editor rather than in the transcript, where the
+conversation would push it out of sight:
+
+```
+SSH mac  /Users/lin/ws/api
+restored from this session file · ! and !! run remotely · prefix local: for local
+```
+
+Those two lines stay until your first message or `!` command. The footer keeps naming the
+host for as long as SSH mode is on, and `/ssh status` gives the full picture.
+
 Restoring runs a background reachability probe. If the host does not answer, you get a warning pointing at `/ssh status`; SSH mode stays on, because the host may simply be down for a moment and reconnecting is one `/ssh <host>` away.
 
 What does not travel: there is no live connection to hand over, and a command that was mid-flight when the session ended is not resumed. Recovery is a fresh SSH connection, which is all this package ever used.
@@ -168,5 +179,5 @@ MIT — see [LICENSE](LICENSE), `Copyright (c) 2025 Can Celik`.
 - This repository was created with `git subtree split --prefix=packages/pi-ssh-tools`, so the upstream commit history and authorship are preserved.
 - `0.2.0` is the standalone release, and it adds the `user_bash` routing described above: `!` and `!!` follow the active SSH host, `local:` keeps a single command local.
 - `0.2.1` adds the optional `@gotgenes/pi-permission-system` integration described above, so remote paths stop being judged as local ones.
-- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else. It also puts `BatchMode`, `ConnectTimeout`, and keepalive options on every `ssh` call, reports exit 255 as a transport failure instead of a failed command, and stops a broken stdin pipe from taking the process down when ssh exits before reading it. A path starting with `~` now means the remote home instead of being silently rewritten to your local one, a remote file that cannot be read names the reason it cannot, and `PI_SSH_TOOLS_DEBUG=1` logs every call.
+- `0.2.2` records the SSH workspace in the session, so `/resume`, `/fork`, `/clone`, `/new`, `/reload`, and `/tree` carry it the way the session carries everything else. It also puts `BatchMode`, `ConnectTimeout`, and keepalive options on every `ssh` call, reports exit 255 as a transport failure instead of a failed command, and stops a broken stdin pipe from taking the process down when ssh exits before reading it. A path starting with `~` now means the remote home instead of being silently rewritten to your local one, a remote file that cannot be read names the reason it cannot, and `PI_SSH_TOOLS_DEBUG=1` logs every call. A restored workspace is announced in a two-line notice above the editor instead of a transcript line that scrolls away.
 - Maintained independently from here on. Not an upstream release, and not endorsed by the original author.

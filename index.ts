@@ -44,6 +44,7 @@ type SshExecOptions = {
 };
 
 const SSH_STATUS_KEY = "ssh-tools";
+const SSH_NOTICE_KEY = "ssh-tools-notice";
 const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"] as const;
 
 /** How the optional pi-permission-system integration ended up for this session. */
@@ -700,6 +701,36 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		);
 	};
 
+	// A restored workspace is state, not news. notify() appends a dim line to the chat,
+	// which the transcript then pushes up and out of sight - precisely when the user stops
+	// seeing it and still needs to know which machine `!` will hit. The widget above the
+	// editor belongs to the live layout, so it stays until the first interaction; after
+	// that the footer and the per-turn system prompt carry the host.
+	let noticeShown = false;
+
+	const showWorkspaceNotice = (ctx: ExtensionContext, state: SshSessionState, origin: StateOrigin) => {
+		ctx.ui.setWidget(
+			SSH_NOTICE_KEY,
+			[
+				ctx.ui.theme.fg("accent", `SSH ${state.name}  ${state.remoteCwd}`),
+				ctx.ui.theme.fg(
+					"muted",
+					`${STATE_ORIGIN_NOTES[origin]} · ! and !! run remotely · prefix local: for local`,
+				),
+			],
+			{ placement: "aboveEditor" },
+		);
+		noticeShown = true;
+	};
+
+	const hideWorkspaceNotice = (ctx: ExtensionContext) => {
+		if (!noticeShown) {
+			return;
+		}
+		noticeShown = false;
+		ctx.ui.setWidget(SSH_NOTICE_KEY, undefined);
+	};
+
 	// One entry per change keeps the newest copy next to the leaf: /resume reads the
 	// newest match back, /fork and /clone copy the whole branch, and a crash before
 	// session_shutdown cannot lose the workspace. No entry renderer is registered, so
@@ -800,6 +831,8 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		enableSshTools(pi);
 		updateStatus(ctx);
 		persistState();
+		// A restored workspace the user just replaced by hand no longer needs reminding.
+		hideWorkspaceNotice(ctx);
 		ctx.ui.notify(
 			`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd}). ! and !! run remotely; prefix a command with local: to run it locally.`,
 			"info",
@@ -812,6 +845,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		probeToken += 1;
 		disableSshTools(pi);
 		updateStatus(ctx);
+		hideWorkspaceNotice(ctx);
 		persistState();
 		ctx.ui.notify("SSH mode off", "info");
 	};
@@ -925,6 +959,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 
 	// Route user-entered `!` and `!!` commands to the active SSH host. With SSH mode off this handler only points out a stray `local:` marker and returns undefined, so pi executes locally as usual.
 	pi.on("user_bash", (event, ctx) => {
+		hideWorkspaceNotice(ctx);
 		if (!activeTarget) {
 			if (event.command.replace(/^[ \t]+/, "").startsWith(LOCAL_BASH_MARKER)) {
 				ctx.ui.notify("SSH mode is off - local: is not needed here and reaches your shell as a command name", "warning");
@@ -1006,6 +1041,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				? readHandoff(ctx.cwd)
 				: null);
 
+		// Whatever notice the previous session put up is about a workspace this session
+		// has not looked at yet.
+		hideWorkspaceNotice(ctx);
+
 		if (!inherited) {
 			activeTarget = null;
 			lastTarget = null;
@@ -1033,10 +1072,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		ctx.ui.notify(
-			`SSH mode restored: ${inherited.name} (${inherited.remoteCwd}) - ${STATE_ORIGIN_NOTES[recorded ? "session" : "handoff"]}. ! and !! run remotely; prefix a command with local: to run it locally.`,
-			"info",
-		);
+		showWorkspaceNotice(ctx, inherited, recorded ? "session" : "handoff");
 		probeWorkspace({ name: inherited.name, remote: inherited.remote, remoteCwd: inherited.remoteCwd }, ctx);
 	});
 
@@ -1057,7 +1093,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		if (recorded?.active) {
 			applyState(recorded, "session");
 			updateStatus(ctx);
-			ctx.ui.notify(`SSH mode follows the session tree: ${recorded.name} (${recorded.remoteCwd})`, "info");
+			showWorkspaceNotice(ctx, recorded, "session");
 			probeWorkspace({ name: recorded.name, remote: recorded.remote, remoteCwd: recorded.remoteCwd }, ctx);
 			return;
 		}
@@ -1065,12 +1101,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		stateOrigin = "none";
 		probeToken += 1;
 		disableSshTools(pi);
+		hideWorkspaceNotice(ctx);
 		updateStatus(ctx);
 		const reason = recorded ? `${recorded.name} is not connected at this point` : "the selected point has no SSH workspace";
 		ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${reason}`, "info");
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
+		// The notice above the editor covers the moment before the user acts. Once a turn
+		// starts, the footer and the per-turn system prompt say the same thing.
+		hideWorkspaceNotice(ctx);
 		if (!activeTarget) {
 			return;
 		}
