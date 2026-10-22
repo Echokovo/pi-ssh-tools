@@ -9,6 +9,8 @@ import {
 	createLocalBashOperations,
 	createReadToolDefinition,
 	createWriteToolDefinition,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
 	type EditOperations,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -354,6 +356,41 @@ function withCwd<T>(ctx: T, cwd: string): T {
 	Object.defineProperty(copy, "cwd", { value: cwd, enumerable: true, configurable: true, writable: true });
 	return copy;
 }
+
+/**
+ * Mirror of pi's internal `startToolTimer`, which the package does not export. It seeds the context
+ * state `bashBase.renderResult` reads, so a running `ssh_bash` row ticks `Elapsed Xs` while the
+ * command is still going instead of only reporting `Took Xs` once it ends.
+ */
+function startToolTimer(context: { executionStarted: boolean; state?: { startedAt?: number; endedAt?: number } }) {
+	const state = context.state;
+	if (state && context.executionStarted && state.startedAt === undefined) {
+		state.startedAt = Date.now();
+		state.endedAt = undefined;
+	}
+}
+
+/**
+ * pi's own bash description with only its first sentence swapped, so the truncation limits and the
+ * optional `timeout` hint stay word for word what local `bash` tells the model.
+ */
+function remoteBashDescription(baseDescription: string): string {
+	const lead = "Execute a bash command on the active SSH host in the active remote working directory.";
+	return `${lead} ${baseDescription.replace(/^[^.]*\.\s*/, "")}`;
+}
+
+/** pi's read limits phrased for the remote host, so the model knows to page a large file with `offset`. */
+const SSH_READ_DESCRIPTION =
+	"Read a file on the active SSH host. Relative paths are resolved against the active remote working directory; " +
+	"~ is the remote user's home. Images (jpg, jpeg, png, gif, webp) come back as attachments. Text is truncated to " +
+	`the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB, so use offset/limit for large files and ` +
+	"continue with offset until the file is complete.";
+
+/** The remote write runs through `mkdir -p`, so the parent-directory promise is as true as it is locally. */
+const SSH_WRITE_DESCRIPTION =
+	"Write a text file on the active SSH host, creating it when it is absent and overwriting it when it is not. " +
+	"Parent directories are created as needed. Relative paths are resolved against the active remote working " +
+	"directory; ~ is the remote user's home.";
 
 function parseSshConfigProfiles(): SshProfile[] {
 	if (!existsSync(SSH_CONFIG_PATH)) {
@@ -1071,10 +1108,15 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_read",
 		label: "ssh_read",
-		description: "Read a file on the active SSH host. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
+		description: SSH_READ_DESCRIPTION,
 		promptSnippet: "Read file contents on the active SSH host",
-		promptGuidelines: ["Use ssh_read when the task is on the active SSH host instead of the local machine."],
+		promptGuidelines: [
+			"Use ssh_read when the task is on the active SSH host instead of the local machine.",
+			"Use ssh_read to examine a remote file instead of cat or sed through ssh_bash.",
+		],
 		parameters: readBase.parameters,
+		outputSchema: readBase.outputSchema,
+		constrainedSampling: readBase.constrainedSampling,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const path = await expandRemoteTilde("ssh_read", params.path, target);
@@ -1096,10 +1138,11 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_write",
 		label: "ssh_write",
-		description: "Write a text file on the active SSH host. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
+		description: SSH_WRITE_DESCRIPTION,
 		promptSnippet: "Create or overwrite files on the active SSH host",
 		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
 		parameters: writeBase.parameters,
+		constrainedSampling: writeBase.constrainedSampling,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const path = await expandRemoteTilde("ssh_write", params.path, target);
@@ -1122,12 +1165,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		name: "ssh_edit",
 		label: "ssh_edit",
 		description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
-		promptSnippet: "Make precise file edits on the active SSH host",
+		promptSnippet: "Make precise file edits on the active SSH host, including several disjoint edits in one call",
 		promptGuidelines: [
-			"Use ssh_edit for precise remote changes.",
-			"Each edits[].oldText must match exactly on the remote file.",
+			"Use ssh_edit for precise remote changes (edits[].oldText must match exactly).",
+			"When changing multiple separate locations in one remote file, use one ssh_edit call with several entries in edits[] instead of several ssh_edit calls.",
+			"Each edits[].oldText is matched against the original remote file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+			"Keep edits[].oldText as small as possible while still being unique in the remote file. Do not pad with large unchanged regions.",
 		],
 		parameters: editBase.parameters,
+		constrainedSampling: editBase.constrainedSampling,
+		renderShell: editBase.renderShell,
 		prepareArguments: editBase.prepareArguments,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
@@ -1154,21 +1201,27 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_bash",
 		label: "ssh_bash",
-		description: "Execute a bash command on the active SSH host in the active remote working directory.",
+		description: remoteBashDescription(bashBase.description),
 		promptSnippet: "Execute bash commands on the active SSH host",
 		promptGuidelines: ["Use ssh_bash when the command must run on the active SSH host rather than locally."],
 		parameters: bashBase.parameters,
+		outputSchema: bashBase.outputSchema,
+		constrainedSampling: bashBase.constrainedSampling,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const tool = createBashToolDefinition(target.remoteCwd, { operations: createRemoteBashOps(target) });
 			return tool.execute(toolCallId, params, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		renderCall(args, theme, context) {
+			startToolTimer(context);
 			const command = typeof args?.command === "string" ? args.command : "...";
+			const timeout = typeof args?.timeout === "number" && args.timeout > 0 ? args.timeout : undefined;
 			const targetLabel = activeTarget ? activeTarget.name : "inactive";
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			text.setText(
-				`${theme.fg("toolTitle", theme.bold("ssh_bash"))} ${theme.fg("accent", command)} ${theme.fg("muted", `[${targetLabel}]`)}`,
+				`${theme.fg("toolTitle", theme.bold("ssh_bash"))} ${theme.fg("accent", command)}` +
+					(timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "") +
+					` ${theme.fg("muted", `[${targetLabel}]`)}`,
 			);
 			return text;
 		},
