@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, sep } from "node:path";
@@ -105,6 +105,23 @@ const SSH_CONNECT_TIMEOUT_SECONDS = 10;
 /** Notice a dead link after ~45s instead of on the next write, and keep idle NAT and proxy timers from dropping a healthy one. */
 const SSH_KEEPALIVE_INTERVAL_SECONDS = 15;
 const SSH_KEEPALIVE_COUNT_MAX = 3;
+/**
+ * How long to keep reading after the ssh client has exited. Output still arriving
+ * re-arms this, so only a quiet pipe ends the call.
+ */
+const SSH_STDIO_GRACE_MS = 100;
+/**
+ * Hard limit on reading the pipes after the client exited, however busy they still
+ * are: a remote job that outlived its channel keeps a mux master writing forever.
+ */
+const SSH_DRAIN_CAP_MS = 5000;
+/** SIGTERM the client's group, and insist with SIGKILL when it will not go. */
+const SSH_KILL_ESCALATION_MS = 750;
+/**
+ * A control call (`/ssh <host>`, a `~` lookup) has no keypress waiting behind it, so
+ * it must not sit on a half-open link forever. Generous next to ConnectTimeout=10.
+ */
+const SSH_CONTROL_TIMEOUT_SECONDS = 30;
 
 /**
  * Opt-in call log: `PI_SSH_TOOLS_DEBUG=1 pi`. The tool error is what the model sees and
@@ -266,7 +283,11 @@ function remoteRelativePath(path: string, remoteCwd: string): string {
  */
 function remoteHomeDir(target: ActiveSshTarget): Promise<string> {
 	if (!target.remoteHome) {
-		target.remoteHome = sshOk(target.remote, 'printf %s "$HOME"')
+		// A timeout rather than the caller's signal: this one promise is shared by every
+		// later `~` path, so letting one aborted call reject it would break the others.
+		target.remoteHome = sshOk(target.remote, 'printf %s "$HOME"', {
+			timeoutSeconds: SSH_CONTROL_TIMEOUT_SECONDS,
+		})
 			.then((value) => {
 				const home = value.toString("utf8").trim();
 				if (!home.startsWith("/")) {
@@ -419,61 +440,253 @@ function sshBaseOptions(options: SshExecOptions): string[] {
 	];
 }
 
+/**
+ * Resolve when the ssh call is over, and never later than that.
+ *
+ * `close` is the wrong event to wait on: it fires at stdout and stderr EOF, and the
+ * write end of those pipes is not held only by the client. With `ControlMaster` the
+ * client hands the session's stdio to the mux master over the control socket, and that
+ * master then outlives the client for as long as `ControlPersist` says; a forked helper
+ * - `ProxyCommand`, `Match exec`, `PermitLocalCommand` - does the same. So after an
+ * abort `close` never fires: the tool call never returns, pi's agent never goes idle,
+ * and Esc has nothing left to cancel.
+ *
+ * Wait for the client to exit instead, then keep reading only until the pipes fall
+ * idle. pi's own local shell does this through `waitForChildProcess`, which is not
+ * exported, so it is spelled out here. Two bounds go past what pi needs locally,
+ * because here the writer can be a process that is not ours to kill:
+ *
+ * - once termination has been requested, output no longer means "the command is
+ *   finishing up" but "a session is still running remotely", so stop re-arming the
+ *   idle timer and let it expire;
+ * - untouched, a writer that outlived the client and keeps producing would hold the
+ *   call open forever, so the drain gets an absolute deadline as well.
+ */
+function waitForSshCall(child: ChildProcess, shouldKeepDraining: () => boolean): Promise<number | null> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let exited = false;
+		let exitCode: number | null = null;
+		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let drainCap: ReturnType<typeof setTimeout> | undefined;
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+
+		const settle = () => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			if (idleTimer) {
+				clearTimeout(idleTimer);
+			}
+			if (drainCap) {
+				clearTimeout(drainCap);
+			}
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolve(exitCode);
+		};
+		const settleIfStreamsDone = () => {
+			if (exited && stdoutEnded && stderrEnded) {
+				settle();
+			}
+		};
+		const armIdleTimer = () => {
+			if (idleTimer) {
+				clearTimeout(idleTimer);
+			}
+			idleTimer = setTimeout(settle, SSH_STDIO_GRACE_MS);
+		};
+		const onData = () => {
+			if (exited && !settled && shouldKeepDraining()) {
+				armIdleTimer();
+			}
+		};
+
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.stdout?.once("end", () => {
+			stdoutEnded = true;
+			settleIfStreamsDone();
+		});
+		child.stderr?.once("end", () => {
+			stderrEnded = true;
+			settleIfStreamsDone();
+		});
+		child.once("exit", (code) => {
+			exited = true;
+			exitCode = code;
+			settleIfStreamsDone();
+			if (!settled) {
+				armIdleTimer();
+				drainCap = setTimeout(settle, SSH_DRAIN_CAP_MS);
+			}
+		});
+		child.once("close", (code) => {
+			exitCode = code;
+			settle();
+		});
+		child.once("error", (error) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			if (idleTimer) {
+				clearTimeout(idleTimer);
+			}
+			if (drainCap) {
+				clearTimeout(drainCap);
+			}
+			reject(error);
+		});
+	});
+}
+
+/** Process groups of the ssh clients still running, so a pi exit cannot leave one behind. */
+const liveSshGroups = new Set<number>();
+let sshExitCleanupInstalled = false;
+
+function trackSshGroup(pid: number): void {
+	if (!sshExitCleanupInstalled) {
+		sshExitCleanupInstalled = true;
+		// Only synchronous work is possible here, which sending a signal is.
+		process.on("exit", () => {
+			for (const tracked of liveSshGroups) {
+				try {
+					process.kill(-tracked, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		});
+	}
+	liveSshGroups.add(pid);
+}
+
 function sshExec(remote: string, command: string, options: SshExecOptions = {}) {
 	return new Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null }>((resolve, reject) => {
 		const args: string[] = [...sshBaseOptions(options), remote, command];
 		const startedAt = Date.now();
-		const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+		// A process group of its own: ending the call has to reach whatever the client
+		// forked as well, or the survivor keeps the pipes open and the link half-alive.
+		const child = spawn("ssh", args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+		});
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let timedOut = false;
+		let terminating = false;
+		let escalation: ReturnType<typeof setTimeout> | undefined;
+
+		/** True when something was there to signal, which is what makes a log line worth having. */
+		const killGroup = (signal: "SIGTERM" | "SIGKILL"): boolean => {
+			if (!child.pid) {
+				return false;
+			}
+			try {
+				process.kill(-child.pid, signal);
+				return true;
+			} catch {
+				try {
+					return child.kill(signal);
+				} catch {
+					return false; // Already gone.
+				}
+			}
+		};
+
+		/** Abort and timeout end the call the same way: ask once, then insist. */
+		const terminate = () => {
+			terminating = true;
+			killGroup("SIGTERM");
+			if (!escalation) {
+				escalation = setTimeout(() => {
+					// A group still alive here is the finding: a forked helper, or a mux
+					// master that was handed the session's stdio, outlived SIGTERM.
+					if (killGroup("SIGKILL")) {
+						logSshCall(`${remote} group ignored SIGTERM - killed with SIGKILL`);
+					}
+					if (child.pid) {
+						liveSshGroups.delete(child.pid);
+					}
+				}, SSH_KILL_ESCALATION_MS);
+				escalation.unref?.();
+			}
+		};
+
 		const timer =
 			typeof options.timeoutSeconds === "number" && options.timeoutSeconds > 0
 				? setTimeout(() => {
 						timedOut = true;
-						child.kill();
+						terminate();
 					}, options.timeoutSeconds * 1000)
 				: undefined;
 
 		const cleanup = () => {
-			if (timer) clearTimeout(timer);
-			if (options.signal) options.signal.removeEventListener("abort", onAbort);
+			if (timer) {
+				clearTimeout(timer);
+			}
+			if (options.signal) {
+				options.signal.removeEventListener("abort", onAbort);
+			}
+			// Once termination has been requested the group is doomed even though the call
+			// is over: the client exited, but a helper that ignores SIGTERM is still alive
+			// and only the escalation clears it. Letting it run is what stops the leak.
+			if (!terminating) {
+				if (escalation) {
+					clearTimeout(escalation);
+				}
+				if (child.pid) {
+					liveSshGroups.delete(child.pid);
+				}
+			}
 		};
 
 		const onAbort = () => {
-			child.kill();
+			terminate();
 		};
 
-		child.stdout.on("data", (data: Buffer) => {
+		child.stdout?.on("data", (data: Buffer) => {
 			stdoutChunks.push(data);
 			options.onStdoutData?.(data);
 		});
-		child.stderr.on("data", (data: Buffer) => {
+		child.stderr?.on("data", (data: Buffer) => {
 			stderrChunks.push(data);
 			options.onStderrData?.(data);
 		});
-		child.on("error", (error) => {
-			logSshCall(`${remote} could not start: ${error.message}`);
-			cleanup();
-			reject(error);
-		});
-		child.on("close", (exitCode) => {
-			logSshCall(describeSshCall(remote, command, exitCode, Date.now() - startedAt, Buffer.concat(stderrChunks)));
-			cleanup();
-			if (options.signal?.aborted) {
-				reject(new Error("aborted"));
-				return;
-			}
-			if (timedOut) {
-				reject(new Error(`timeout:${options.timeoutSeconds}`));
-				return;
-			}
-			resolve({
-				stdout: Buffer.concat(stdoutChunks),
-				stderr: Buffer.concat(stderrChunks),
-				exitCode,
-			});
-		});
+
+		if (child.pid && process.platform !== "win32") {
+			trackSshGroup(child.pid);
+		}
+
+		waitForSshCall(child, () => !terminating).then(
+			(exitCode) => {
+				logSshCall(
+					describeSshCall(remote, command, exitCode, Date.now() - startedAt, Buffer.concat(stderrChunks)),
+				);
+				cleanup();
+				if (options.signal?.aborted) {
+					reject(new Error("aborted"));
+					return;
+				}
+				if (timedOut) {
+					reject(new Error(`timeout:${options.timeoutSeconds}`));
+					return;
+				}
+				resolve({
+					stdout: Buffer.concat(stdoutChunks),
+					stderr: Buffer.concat(stderrChunks),
+					exitCode,
+				});
+			},
+			(error: unknown) => {
+				logSshCall(`${remote} could not start: ${summarizeError(error)}`);
+				cleanup();
+				reject(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
 
 		if (options.signal) {
 			if (options.signal.aborted) {
@@ -487,11 +700,11 @@ function sshExec(remote: string, command: string, options: SshExecOptions = {}) 
 		// key does exactly that - and the failed write then emits EPIPE on this socket. An
 		// unhandled 'error' event would take the process down with it, while the real
 		// failure is already reported through the exit code and stderr.
-		child.stdin.on("error", () => {});
+		child.stdin?.on("error", () => {});
 		if (options.stdin !== undefined) {
-			child.stdin.write(options.stdin);
+			child.stdin?.write(options.stdin);
 		}
-		child.stdin.end();
+		child.stdin?.end();
 	});
 }
 
@@ -540,7 +753,8 @@ async function resolveRemoteCwd(profile: SshProfile): Promise<string> {
 	if (profile.cwd?.trim()) {
 		return profile.cwd.trim();
 	}
-	return (await sshOk(profile.remote, "pwd")).toString("utf8").trim();
+	// /ssh <host> awaits this with nothing to cancel it, so it cannot be allowed to wait forever.
+	return (await sshOk(profile.remote, "pwd", { timeoutSeconds: SSH_CONTROL_TIMEOUT_SECONDS })).toString("utf8").trim();
 }
 
 /**
@@ -560,33 +774,37 @@ function remoteAccessCheck(path: string, requireWritable: boolean): string {
 	].join("; ");
 }
 
-function createRemoteReadOps(target: ActiveSshTarget): ReadOperations {
+/** The signal is the tool call's own, so Esc ends a remote read instead of only a bash one. */
+function createRemoteReadOps(target: ActiveSshTarget, signal?: AbortSignal): ReadOperations {
 	return {
-		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`),
-		access: (absolutePath) => sshOk(target.remote, remoteAccessCheck(absolutePath, false)).then(() => {}),
+		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`, { signal }),
+		access: (absolutePath) => sshOk(target.remote, remoteAccessCheck(absolutePath, false), { signal }).then(() => {}),
 		detectImageMimeType: async (absolutePath) => inferImageMimeType(absolutePath),
 	};
 }
 
-function createRemoteWriteOps(target: ActiveSshTarget): WriteOperations {
+function createRemoteWriteOps(target: ActiveSshTarget, signal?: AbortSignal): WriteOperations {
 	return {
 		writeFile: async (absolutePath, content) => {
-			await sshOk(target.remote, `cat > ${shellQuote(absolutePath)}`, { stdin: content });
+			await sshOk(target.remote, `cat > ${shellQuote(absolutePath)}`, { stdin: content, signal });
 		},
-		mkdir: (dir) => sshOk(target.remote, `mkdir -p ${shellQuote(dir)}`).then(() => {}),
+		mkdir: (dir) => sshOk(target.remote, `mkdir -p ${shellQuote(dir)}`, { signal }).then(() => {}),
 	};
 }
 
-function createRemoteEditOps(target: ActiveSshTarget, localCwd: string): EditOperations {
+function createRemoteEditOps(target: ActiveSshTarget, localCwd: string, signal?: AbortSignal): EditOperations {
 	const remotePath = (path: string) => toRemotePath(path, localCwd, target.remoteCwd);
 	return {
-		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`),
+		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`, { signal }),
 		writeFile: async (absolutePath, content) => {
-			await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, { stdin: content });
+			await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, {
+				stdin: content,
+				signal,
+			});
 		},
 		access: (absolutePath) => {
 			const path = remotePath(absolutePath);
-			return sshOk(target.remote, remoteAccessCheck(path, true)).then(() => {});
+			return sshOk(target.remote, remoteAccessCheck(path, true), { signal }).then(() => {});
 		},
 	};
 }
@@ -860,7 +1078,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const path = await expandRemoteTilde("ssh_read", params.path, target);
-			const tool = createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
+			const tool = createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target, signal) });
 			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		renderCall(args, theme) {
@@ -885,7 +1103,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const path = await expandRemoteTilde("ssh_write", params.path, target);
-			const tool = createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
+			const tool = createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target, signal) });
 			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		renderCall(args, theme) {
@@ -918,7 +1136,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				...params,
 				path: toLocalEditPath(await expandRemoteTilde("ssh_edit", params.path, target), target.remoteCwd),
 			};
-			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd) });
+			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd, signal) });
 			return tool.execute(toolCallId, transformedParams, signal, onUpdate, withCwd(ctx, localCwd));
 		},
 		renderCall(args, theme) {

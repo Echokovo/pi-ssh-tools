@@ -35,21 +35,28 @@ Not done yet because the failure classification is brand new and only covered by
 `ssh` output. Let it see real hosts first, otherwise a retry policy would be built on
 patterns nobody has observed.
 
-## Keep a remote command alive when the link drops
+## No persistent remote shell
 
-A command running under `ssh_bash` dies with the connection. Nothing in the ssh client can
-prevent that; the command has to be started under a remote session wrapper (`tmux`,
-`screen`, or `nohup` plus a log file) and re-attached later.
+A command running under `ssh_bash` dies with the connection. Keeping it would mean
+starting it under a remote session wrapper (`tmux`, `screen`, or `nohup` plus a log
+file) and re-attaching later, which is a different product: a session name, a way to
+poll output, and a kill command.
 
-This is a different product shape from the current one-shot `ssh_bash`: it needs a session
-name, a way to poll output, and a kill command. Worth a separate release, and worth asking
-whether the model should see a persistent remote shell at all.
+Not doing this. The model should not see a persistent remote shell. `ssh_bash` stays a
+one-shot command, and a dropped link ends it.
 
-## Make the timeouts configurable
+## Stop the remote command when a call is cancelled
 
-`ConnectTimeout=10`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and the 5s probe
-timeout are constants in `index.ts`. High-latency links (VPN, jump hosts through the
-GFW) may need a longer connect timeout, which currently means editing the source.
+Cancelling an `ssh_bash` - Esc, or a timeout - ends the local call promptly: the client
+runs in its own process group, so the signal reaches whatever it forked as well, and the
+call settles when the client exits instead of when its pipes close.
 
-Deferred deliberately: a settings surface needs a documented default and a place to show
-the effective value, and there is no evidence yet that anyone needs to change them.
+`ControlMaster` makes it worse rather than better: the mux master owns the channel, so
+killing the client does not even close it, and the master keeps the output flowing.
+
+What still keeps running is the remote side. Without a PTY the sshd does not send SIGHUP
+when the channel dies, so an aborted `npm run build` carries on on the host and may hold a
+lock the next call then waits on. Allocating a PTY (`-t`) would fix that, at the cost of
+escape sequences and `\r\n` in the captured output. A wrapper script that traps and kills
+its own process group was the other option, but that wrapper only makes sense as part of a
+persistent remote shell, which this package will not grow.

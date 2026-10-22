@@ -45,7 +45,7 @@ That makes remote work explicit instead of silently swapping out local tools.
 /ssh
 /ssh mac
 /ssh clawd
-/ssh mac:/Users/can/project
+/ssh mac:/home/can/project
 /ssh status
 /ssh off
 ```
@@ -89,7 +89,7 @@ The marker is stripped before execution. It only applies while SSH mode is on: w
 Two details worth knowing:
 
 - `shellCommandPrefix` from settings is dropped for remote commands, because it usually sources local shell setup such as `~/.bash_aliases`. It still applies to `local:` commands.
-- Remote commands run in a non-interactive shell, exactly like `ssh_bash`. Full-screen programs such as `vim` or `htop` are not supported.
+- Remote commands run in a non-interactive shell, exactly like `ssh_bash`. Full-screen programs such as `vim` or `htop` are not supported, and neither is a persistent remote shell: `ssh_bash` is a one-shot command, so a dropped link ends it.
 
 ## SSH mode follows the session
 
@@ -107,7 +107,7 @@ A restored workspace is announced above the editor rather than in the transcript
 conversation would push it out of sight:
 
 ```
-SSH mac  /Users/lin/ws/api
+SSH mac  /home/lin/ws/api
 restored from this session file · ! and !! run remotely · prefix local: for local
 ```
 
@@ -131,6 +131,32 @@ The integration is optional, discovered at runtime through that package's proces
 
 Understand what that buys: remote files are then governed by the SSH target you picked, not by rules written for local paths. That is the only honest boundary here, since `ssh_bash` can already reach any path on the active host.
 
+## Reusing the SSH connection
+
+Every tool call is its own `ssh` process, and this package sets no `ControlMaster` option, so by default each call pays a full TCP + key-exchange handshake. OpenSSH can share one connection between those processes. It is configured in `~/.ssh/config`, and the package needs no change to benefit from it. Add this for the hosts you use with `/ssh`:
+
+```
+Host mac
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 120
+```
+
+Or for every host:
+
+```
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 120
+```
+
+- Keep `ControlPersist`. Without it, the first `ssh` process stays alive as the master and holds the stdout/stderr pipes this package waits on, so a call may never return. With it, the master moves to the background and each call exits normally.
+- `%C` is a hash of the connection, so the socket path stays short enough for the ~108-byte Unix socket limit.
+- No cleanup is needed. The master exits after 120 idle seconds, and ssh dials a new connection when it finds a stale socket.
+- `ConnectTimeout` only applies while the master is being established, and `ServerAliveInterval` / `ServerAliveCountMax` follow the call that created it.
+- Check that it took effect with `ssh -G <host> | rg -i '^control'`: `controlmaster` should be `auto` and `controlpersist` should not be `no`. `PI_SSH_TOOLS_DEBUG=1` then shows the first call slower than the ones after it.
+
 ## Debugging
 
 ```bash
@@ -138,10 +164,10 @@ PI_SSH_TOOLS_DEBUG=1 pi
 ```
 
 Every `ssh` call then appends one line to `pi-ssh-tools.log` in your temp directory
-(`/tmp/pi-ssh-tools.log` on Linux):
+(`/tmp/pi-ssh-tools.log`):
 
 ```
-2026-10-18T14:31:52.002Z mac exit=1 1ms cmd="if [ ! -e '/Users/lin/notes.md' ]; ..." stderr="no such file: /Users/lin/notes.md"
+2026-10-18T14:31:52.002Z mac exit=1 1ms cmd="if [ ! -e '/home/lin/notes.md' ]; ..." stderr="no such file: /home/lin/notes.md"
 ```
 
 That is the whole call — host, exit code, duration, the command that ran, and what ssh
@@ -151,6 +177,7 @@ is never written to it. Unset the variable and nothing is logged.
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi)
+- Linux as the local machine. macOS and Windows are not targeted
 - local `ssh` client available in `$PATH`
 - key-based auth: every call runs with `BatchMode=yes`, so ssh is never allowed to ask for a passphrase, a password, or a host-key answer
 - `bash` available on the remote host
@@ -162,7 +189,7 @@ accept a new host key once from your own terminal before pointing `/ssh` at it.
 
 ## Notes
 
-- `ssh_write` writes file content over stdin, which behaves better on macOS than GNU-specific `base64 -d` shell snippets
+- `ssh_write` writes file content over stdin, instead of going through `base64 -d` shell snippets
 - relative remote paths resolve against the active remote cwd
 - `~` means the **remote** user's home: `~/notes.md` is expanded against the host's `$HOME`, asked once per connection and only when a path needs it, the way a `!` command on that host already reads it; `~user` is refused
 - image reads are supported for common extensions: jpg, jpeg, png, gif, webp
