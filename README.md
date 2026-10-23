@@ -190,7 +190,7 @@ accept a new host key once from your own terminal before pointing `/ssh` at it.
 ## Notes
 
 - `ssh_write` writes file content over stdin, instead of going through `base64 -d` shell snippets
-- relative remote paths resolve against the active remote cwd
+- relative remote paths resolve against the active remote cwd, and an absolute path is taken as it stands — the same rule for `ssh_read`, `ssh_write`, and `ssh_edit`
 - `~` means the **remote** user's home: `~/notes.md` is expanded against the host's `$HOME`, asked once per connection and only when a path needs it, the way a `!` command on that host already reads it; `~user` is refused
 - image reads are detected from the file's leading bytes rather than its extension, the way the local `read` tool does it (jpeg, gif, webp, non-animated png, bmp), and the sniff rides along on the existence check instead of costing another round trip
 - `ssh_read`, `ssh_write`, `ssh_edit`, and `ssh_bash` are pi's own `read` / `write` / `edit` / `bash` tools with remote operations behind them, so they keep pi's parameter schema, structured output, constrained sampling, truncation limits, and tool-row display: the `(timeout 30s)` suffix, the `Elapsed` / `Took` timing, and the edit tool's own frame. Only the leading sentence of each description is rewritten for the remote host

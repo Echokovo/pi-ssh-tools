@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join } from "node:path";
 import {
 	type BashOperations,
 	createBashToolDefinition,
@@ -274,19 +274,6 @@ function normalizeRemoteDir(path: string): string {
 	return path.length > 1 ? path.replace(/\/+$/, "") : path;
 }
 
-function remoteRelativePath(path: string, remoteCwd: string): string {
-	const normalizedCwd = normalizeRemoteDir(remoteCwd);
-	if (path === normalizedCwd) {
-		return ".";
-	}
-	if (!path.startsWith(`${normalizedCwd}/`)) {
-		throw new Error(
-			`Remote path ${path} is outside the active SSH working directory ${remoteCwd}. Use a relative path or switch SSH mode to that directory.`,
-		);
-	}
-	return path.slice(normalizedCwd.length + 1);
-}
-
 /**
  * The remote user's home directory: asked once per target, and only when a path
  * actually starts with `~`, so the common call costs no extra round trip.
@@ -335,24 +322,6 @@ async function expandRemoteTilde(toolName: string, path: string, target: ActiveS
 		return `${await remoteHomeDir(target)}/${path.slice(2)}`;
 	}
 	throw new Error(`${toolName} does not expand ~user paths. Use ~ or a path relative to ${target.remoteCwd}.`);
-}
-
-function toLocalEditPath(path: string, remoteCwd: string): string {
-	if (isAbsolute(path)) {
-		return remoteRelativePath(path, remoteCwd);
-	}
-	return path;
-}
-
-function toRemotePath(path: string, localCwd: string, remoteCwd: string): string {
-	const relativePath = relative(localCwd, path).split(sep).join("/");
-	if (relativePath.startsWith("../") || relativePath === "..") {
-		throw new Error(`Resolved edit path ${path} escaped the local SSH edit workspace.`);
-	}
-	if (!relativePath || relativePath === ".") {
-		return remoteCwd;
-	}
-	return `${normalizeRemoteDir(remoteCwd)}/${relativePath}`;
 }
 
 function withCwd<T>(ctx: T, cwd: string): T {
@@ -936,20 +905,20 @@ function createRemoteWriteOps(target: ActiveSshTarget, signal?: AbortSignal): Wr
 	};
 }
 
-function createRemoteEditOps(target: ActiveSshTarget, localCwd: string, signal?: AbortSignal): EditOperations {
-	const remotePath = (path: string) => toRemotePath(path, localCwd, target.remoteCwd);
+/**
+ * The edit tool is built on the remote cwd, so every absolute path it hands these operations is
+ * already a remote path: nothing is translated, and no local directory enters the picture.
+ */
+function createRemoteEditOps(target: ActiveSshTarget, signal?: AbortSignal): EditOperations {
 	return {
-		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`, { signal }),
+		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`, { signal }),
 		writeFile: async (absolutePath, content) => {
-			await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, {
+			await sshOk(target.remote, `cat > ${shellQuote(absolutePath)}`, {
 				stdin: content,
 				signal,
 			});
 		},
-		access: (absolutePath) => {
-			const path = remotePath(absolutePath);
-			return sshOk(target.remote, remoteAccessCheck(path, true), { signal }).then(() => {});
-		},
+		access: (absolutePath) => sshOk(target.remote, remoteAccessCheck(absolutePath, true), { signal }).then(() => {}),
 	};
 }
 
@@ -1037,24 +1006,20 @@ function editPreviewArgsKey(input: SshEditInput | null): string | undefined {
  */
 async function computeRemoteEditPreview(target: ActiveSshTarget, input: SshEditInput): Promise<SshEditPreview> {
 	try {
-		const localCwd = process.cwd();
-		// The same path maths the real call does, so the preview reads the file the edit will write.
-		const editPath = toLocalEditPath(await expandRemoteTilde("ssh_edit", input.path, target), target.remoteCwd);
-		const remotePath = toRemotePath(resolve(localCwd, editPath), localCwd, target.remoteCwd);
-		const content = await sshOk(target.remote, `cat ${shellQuote(remotePath)}`);
-		const tool = createEditToolDefinition(localCwd, {
-			operations: {
-				access: async () => {},
-				readFile: async () => content,
-				writeFile: async () => {},
-			},
+		// Same tool, same cwd, same path maths as the real call, so the file the preview reads is
+		// the file the edit will write. Only the upload is swapped for a no-op, and the existence
+		// check is dropped: `cat` fails on its own, and the check would be a second round trip.
+		const path = await expandRemoteTilde("ssh_edit", input.path, target);
+		const operations = createRemoteEditOps(target);
+		const tool = createEditToolDefinition(target.remoteCwd, {
+			operations: { access: async () => {}, readFile: operations.readFile, writeFile: async () => {} },
 		});
 		const result = await tool.execute(
 			"ssh_edit_preview",
-			{ path: editPath, edits: input.edits },
+			{ path, edits: input.edits },
 			undefined,
 			undefined,
-			{ cwd: localCwd } as unknown as Parameters<typeof tool.execute>[4],
+			{ cwd: target.remoteCwd } as unknown as Parameters<typeof tool.execute>[4],
 		);
 		const details = result.details as EditToolDetails | undefined;
 		if (typeof details?.diff !== "string") {
@@ -1657,13 +1622,12 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		prepareArguments: editBase.prepareArguments,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
-			const localCwd = process.cwd();
-			const transformedParams = {
-				...params,
-				path: toLocalEditPath(await expandRemoteTilde("ssh_edit", params.path, target), target.remoteCwd),
-			};
-			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd, signal) });
-			return tool.execute(toolCallId, transformedParams, signal, onUpdate, withCwd(ctx, localCwd));
+			// Built on the remote cwd, like ssh_read and ssh_write: the same resolution pi applies to
+			// both, so a path is accepted by all three file tools or refused by all three, and the
+			// row, the diff headers, and the reply all name the file the way the call asked for it.
+			const path = await expandRemoteTilde("ssh_edit", params.path, target);
+			const tool = createEditToolDefinition(target.remoteCwd, { operations: createRemoteEditOps(target, signal) });
+			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
 		// pi's edit tool draws its own frame (`renderShell: "self"`), so this one has to as well:
 		// a bare Text here would leave the row with neither the default shell's background nor its own.
