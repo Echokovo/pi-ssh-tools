@@ -60,3 +60,15 @@ lock the next call then waits on. Allocating a PTY (`-t`) would fix that, at the
 escape sequences and `\r\n` in the captured output. A wrapper script that traps and kills
 its own process group was the other option, but that wrapper only makes sense as part of a
 persistent remote shell, which this package will not grow.
+
+## Name a failing remote command as one
+
+A remote command that exits nonzero is reported as `SSH failed (1): no such file: /x`.
+Nothing about the link failed, so the model reads a missing file as a connection problem
+and tends to retry the call or blame SSH. Transport failures already have their own
+wording, which is what the prefix is for, so the generic branch could say
+`Remote command failed (1):` and keep the transport messages as they are.
+
+Not done yet because: the sentence is model-visible, and the same phrase appears in the
+comment about the old unreadable-file message, so it wants its own decision instead of
+riding along with a behaviour fix.
