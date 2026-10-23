@@ -162,12 +162,13 @@ type SshSessionState = {
 };
 
 /** Where the currently applied workspace came from. */
-type StateOrigin = "none" | "session" | "handoff" | "manual";
+type StateOrigin = "none" | "session" | "handoff" | "carried" | "manual";
 
 const STATE_ORIGIN_NOTES: Record<StateOrigin, string> = {
 	none: "started in this session",
 	session: "restored from this session file",
 	handoff: "inherited from the previous session",
+	carried: "carried over when you changed branch",
 	manual: "selected in this session",
 };
 
@@ -1655,35 +1656,44 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		probeWorkspace({ name: inherited.name, remote: inherited.remote, remoteCwd: inherited.remoteCwd }, ctx);
 	});
 
-	// /tree moves the leaf, and with it the newest recorded workspace. Nothing is
-	// written here: the entry found on this branch already is the record for it.
+	// /tree moves the leaf, and with it the newest recorded workspace. A branch that carries no
+	// record of its own keeps the live one: the entry the last /ssh wrote sits after the leaf the
+	// moment you step back, so "nothing recorded here" is what one node back looks like, not a
+	// request to drop the connection. A branch that does carry a record decides for itself.
 	pi.on("session_tree", async (_event, ctx) => {
 		const recorded = findSessionState(ctx.sessionManager.getBranch());
-		// Compare against what this branch recorded the last time we looked. The live
-		// snapshot cannot answer "did anything change?" here: after /ssh off it still
-		// names the last host, so walking around a session that never used SSH would
-		// notify on every single /tree move.
-		if (sameSessionState(lastRecordedState, recorded)) {
+		const inherited = recorded ?? snapshotState();
+		if (!inherited) {
+			// Neither this branch nor this process knows a workspace: nothing to report about it.
 			return;
 		}
+		// Compared against what the branch we left recorded, so walking around a session that
+		// never used SSH, or re-picking a point that changes nothing, stays quiet.
+		const changed = !sameSessionState(lastRecordedState, inherited);
 		const wasActive = Boolean(activeTarget);
-		lastRecordedState = recorded;
+		lastRecordedState = inherited;
+		// What this branch holds itself, so carrying a workspace over writes it down once here
+		// and the branch owns it from now on - a later /resume of this file finds it again.
 		lastPersistedState = recorded;
-		if (recorded?.active) {
-			applyState(recorded, "session");
+		if (inherited.active) {
+			applyState(inherited, recorded ? "session" : "carried");
 			updateStatus(ctx);
-			showWorkspaceNotice(ctx, recorded, "session");
-			probeWorkspace({ name: recorded.name, remote: recorded.remote, remoteCwd: recorded.remoteCwd }, ctx);
+			persistState();
+			if (changed) {
+				showWorkspaceNotice(ctx, inherited, recorded ? "session" : "carried");
+				probeWorkspace({ name: inherited.name, remote: inherited.remote, remoteCwd: inherited.remoteCwd }, ctx);
+			}
 			return;
 		}
-		activeTarget = null;
-		stateOrigin = "none";
-		probeToken += 1;
-		disableSshTools(pi);
+		// applyState, not a hand-rolled shutdown: the workspace that just went off must become
+		// the one this process remembers, or the next /tree move reports the previous branch's
+		// host and carries the wrong workspace forward.
+		applyState(inherited, "none");
 		hideWorkspaceNotice(ctx);
 		updateStatus(ctx);
-		const reason = recorded ? `${recorded.name} is not connected at this point` : "the selected point has no SSH workspace";
-		ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${reason}`, "info");
+		if (changed) {
+			ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${inherited.name} is not connected at this point`, "info");
+		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {

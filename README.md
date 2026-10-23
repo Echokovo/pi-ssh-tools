@@ -30,7 +30,7 @@ Or add manually to `~/.pi/agent/settings.json`:
 This package adds a `/ssh` command.
 
 - Default is off
-- SSH mode follows the session: `/resume`, `/fork`, `/clone`, `/new`, and `/tree` bring the workspace back or drop it with the session
+- SSH mode follows the session: `/resume`, `/fork`, `/clone`, `/new`, and `/tree` carry the workspace with them
 - Local `read`, `write`, `edit`, and `bash` stay local
 - When SSH mode is active, the agent also gets `ssh_read`, `ssh_write`, `ssh_edit`, and `ssh_bash`
 - The active remote host and cwd are injected into the system prompt while SSH mode is on
@@ -97,7 +97,7 @@ Connecting records the host and the remote cwd into the session, so the workspac
 
 - `/resume`, `/fork`, and `/clone` come back with the same host and remote cwd
 - `/new` and `/reload` inherit the workspace from the session you were just in
-- `/tree` follows the point you move to — a point before the connect has no SSH mode
+- `/tree` switches to the workspace the point you move to recorded, and keeps the one you are on when that point recorded none — stepping back one node does not drop the connection
 - `/ssh off` is recorded too, so a later session does not resurrect a workspace you closed on purpose
 - a fresh session with no history starts off and writes nothing
 
