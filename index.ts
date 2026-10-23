@@ -1226,8 +1226,14 @@ function renderSshWriteCall(
 function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
-			const script = `cd ${shellQuote(overrideCwd ?? cwd)}\n${command}\n`;
-			const { exitCode, stderr } = await sshExec(target.remote, "exec bash -se", {
+			const dir = overrideCwd ?? cwd;
+			// `bash -s`, not `bash -se`: the local bash tool hands the command to `bash -c`, where a
+			// `;` list carries on after a failing command and the exit code is the last command's.
+			// The guard is the one thing -e was quietly doing - keeping a command out of the login
+			// directory when the requested one is gone - said out loud instead of by side effect.
+			const script =
+				`cd ${shellQuote(dir)} || { echo ${shellQuote(`Cannot change to ${dir} on ${target.name} - the command did not run.`)} >&2; exit 1; }\n${command}\n`;
+			const { exitCode, stderr } = await sshExec(target.remote, "exec bash -s", {
 				stdin: script,
 				signal,
 				timeoutSeconds: timeout,
