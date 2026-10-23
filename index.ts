@@ -9,8 +9,6 @@ import {
 	createLocalBashOperations,
 	createReadToolDefinition,
 	createWriteToolDefinition,
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
 	type EditOperations,
 	type EditToolDetails,
 	type ExtensionAPI,
@@ -348,26 +346,17 @@ function startToolTimer(context: { executionStarted: boolean; state?: { startedA
 }
 
 /**
- * pi's own bash description with only its first sentence swapped, so the truncation limits and the
- * optional `timeout` hint stay word for word what local `bash` tells the model.
+ * Swap only pi's first sentence, the one that says where the file is. Whatever it goes on to say -
+ * the truncation limits, the rules about how edits must not overlap - describes pi's own engine,
+ * and every ssh tool runs that engine on a remote file, so those sentences stay word for word.
  */
-function remoteBashDescription(baseDescription: string): string {
-	const lead = "Execute a bash command on the active SSH host in the active remote working directory.";
-	return `${lead} ${baseDescription.replace(/^[^.]*\.\s*/, "")}`;
+function remoteToolDescription(baseDescription: string, lead: string, remoteNote = ""): string {
+	const rest = baseDescription.replace(/^[^.]*\.\s*/, "");
+	return [lead, rest, remoteNote].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 }
 
-/** pi's read limits phrased for the remote host, so the model knows to page a large file with `offset`. */
-const SSH_READ_DESCRIPTION =
-	"Read a file on the active SSH host. Relative paths are resolved against the active remote working directory; " +
-	"~ is the remote user's home. Images (jpg, jpeg, png, gif, webp) come back as attachments. Text is truncated to " +
-	`the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB, so use offset/limit for large files and ` +
-	"continue with offset until the file is complete.";
-
-/** The remote write runs through `mkdir -p`, so the parent-directory promise is as true as it is locally. */
-const SSH_WRITE_DESCRIPTION =
-	"Write a text file on the active SSH host, creating it when it is absent and overwriting it when it is not. " +
-	"Parent directories are created as needed. Relative paths are resolved against the active remote working " +
-	"directory; ~ is the remote user's home.";
+/** The two ways a remote path differs from a local one, said once rather than in three places. */
+const REMOTE_PATH_NOTE = "Relative paths are resolved against the active remote working directory; ~ is the remote user's home.";
 
 function parseSshConfigProfiles(): SshProfile[] {
 	if (!existsSync(SSH_CONFIG_PATH)) {
@@ -1382,6 +1371,26 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	const writeBase = createWriteToolDefinition("/");
 	const editBase = createEditToolDefinition("/");
 	const bashBase = createBashToolDefinition("/");
+	// Only the first sentence of each description is rewritten; see remoteToolDescription.
+	const readDescription = remoteToolDescription(
+		readBase.description,
+		"Read the contents of a file on the active SSH host.",
+		REMOTE_PATH_NOTE,
+	);
+	const writeDescription = remoteToolDescription(
+		writeBase.description,
+		"Write content to a file on the active SSH host.",
+		REMOTE_PATH_NOTE,
+	);
+	const editDescription = remoteToolDescription(
+		editBase.description,
+		"Edit a single file on the active SSH host using exact text replacement.",
+		REMOTE_PATH_NOTE,
+	);
+	const bashDescription = remoteToolDescription(
+		bashBase.description,
+		"Execute a bash command on the active SSH host in the active remote working directory.",
+	);
 
 	const requireActiveTarget = (): ActiveSshTarget => {
 		if (!activeTarget) {
@@ -1555,7 +1564,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_read",
 		label: "ssh_read",
-		description: SSH_READ_DESCRIPTION,
+		description: readDescription,
 		promptSnippet: "Read file contents on the active SSH host",
 		promptGuidelines: [
 			"Use ssh_read when the task is on the active SSH host instead of the local machine.",
@@ -1588,7 +1597,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_write",
 		label: "ssh_write",
-		description: SSH_WRITE_DESCRIPTION,
+		description: writeDescription,
 		promptSnippet: "Create or overwrite files on the active SSH host",
 		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
 		parameters: writeBase.parameters,
@@ -1608,7 +1617,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_edit",
 		label: "ssh_edit",
-		description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory; ~ is the remote user's home.",
+		description: editDescription,
 		promptSnippet: "Make precise file edits on the active SSH host, including several disjoint edits in one call",
 		promptGuidelines: [
 			"Use ssh_edit for precise remote changes (edits[].oldText must match exactly).",
@@ -1642,7 +1651,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_bash",
 		label: "ssh_bash",
-		description: remoteBashDescription(bashBase.description),
+		description: bashDescription,
 		promptSnippet: "Execute bash commands on the active SSH host",
 		promptGuidelines: ["Use ssh_bash when the command must run on the active SSH host rather than locally."],
 		parameters: bashBase.parameters,
