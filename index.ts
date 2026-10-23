@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	type BashOperations,
 	createBashToolDefinition,
@@ -450,20 +450,97 @@ function normalizeTargetArg(arg: string, profiles: SshProfile[]): SshProfile {
 	return { name: trimmed, remote: trimmed };
 }
 
-function inferImageMimeType(path: string): string | null {
-	switch (extname(path).toLowerCase()) {
-		case ".jpg":
-		case ".jpeg":
-			return "image/jpeg";
-		case ".png":
-			return "image/png";
-		case ".gif":
-			return "image/gif";
-		case ".webp":
-			return "image/webp";
-		default:
-			return null;
+/**
+ * pi decides whether a read is an image by sniffing the leading bytes, never by name: a PNG
+ * called `data.dat` is an image, and a `logo.png` that is really text is not. Its buffer form
+ * of that check is not exported, so mirror it here - same sniff window, same signatures, same
+ * rejections, because pi would not attach an animated PNG or a malformed BMP either.
+ */
+const IMAGE_SNIFF_BYTES = 4100;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+function startsWithBytes(buffer: Buffer, bytes: number[], offset = 0): boolean {
+	return buffer.length >= offset + bytes.length && bytes.every((byte, index) => buffer[offset + index] === byte);
+}
+
+function startsWithAscii(buffer: Buffer, text: string, offset = 0): boolean {
+	return startsWithBytes(buffer, [...Buffer.from(text, "ascii")], offset);
+}
+
+function hasPngHeader(buffer: Buffer): boolean {
+	return buffer.length >= 16 && buffer.readUInt32BE(PNG_SIGNATURE.length) === 13 && startsWithAscii(buffer, "IHDR", 12);
+}
+
+/** Walk the chunk chain: an `acTL` before the first `IDAT` is the animation pi will not inline. */
+function isAnimatedPng(buffer: Buffer): boolean {
+	let offset = PNG_SIGNATURE.length;
+	while (offset + 8 <= buffer.length) {
+		const chunkLength = buffer.readUInt32BE(offset);
+		if (startsWithAscii(buffer, "acTL", offset + 4)) {
+			return true;
+		}
+		if (startsWithAscii(buffer, "IDAT", offset + 4)) {
+			return false;
+		}
+		const next = offset + 8 + chunkLength + 4;
+		if (next <= offset || next > buffer.length) {
+			return false;
+		}
+		offset = next;
 	}
+	return false;
+}
+
+function isBmp(buffer: Buffer): boolean {
+	if (buffer.length < 26) {
+		return false;
+	}
+	const declaredFileSize = buffer.readUInt32LE(2);
+	const pixelDataOffset = buffer.readUInt32LE(10);
+	const dibHeaderSize = buffer.readUInt32LE(14);
+	if (declaredFileSize !== 0 && declaredFileSize < 26) {
+		return false;
+	}
+	if (pixelDataOffset < 14 + dibHeaderSize) {
+		return false;
+	}
+	if (declaredFileSize !== 0 && pixelDataOffset >= declaredFileSize) {
+		return false;
+	}
+	let colorPlanes: number;
+	let bitsPerPixel: number;
+	if (dibHeaderSize === 12) {
+		colorPlanes = buffer.readUInt16LE(22);
+		bitsPerPixel = buffer.readUInt16LE(24);
+	} else if (dibHeaderSize >= 40 && dibHeaderSize <= 124) {
+		if (buffer.length < 30) {
+			return false;
+		}
+		colorPlanes = buffer.readUInt16LE(26);
+		bitsPerPixel = buffer.readUInt16LE(28);
+	} else {
+		return false;
+	}
+	return colorPlanes === 1 && [1, 4, 8, 16, 24, 32].includes(bitsPerPixel);
+}
+
+function sniffImageMimeType(buffer: Buffer): string | null {
+	if (startsWithBytes(buffer, [0xff, 0xd8, 0xff])) {
+		return buffer[3] === 0xf7 ? null : "image/jpeg";
+	}
+	if (startsWithBytes(buffer, PNG_SIGNATURE)) {
+		return hasPngHeader(buffer) && !isAnimatedPng(buffer) ? "image/png" : null;
+	}
+	if (startsWithAscii(buffer, "GIF87a") || startsWithAscii(buffer, "GIF89a")) {
+		return "image/gif";
+	}
+	if (startsWithAscii(buffer, "RIFF") && startsWithAscii(buffer, "WEBP", 8)) {
+		return "image/webp";
+	}
+	if (startsWithAscii(buffer, "BM") && isBmp(buffer)) {
+		return "image/bmp";
+	}
+	return null;
 }
 
 /**
@@ -819,12 +896,34 @@ function remoteAccessCheck(path: string, requireWritable: boolean): string {
 	].join("; ");
 }
 
-/** The signal is the tool call's own, so Esc ends a remote read instead of only a bash one. */
+/**
+ * The signal is the tool call's own, so Esc ends a remote read instead of only a bash one.
+ *
+ * pi checks a file before it asks whether that file is an image, so the check also brings back
+ * the sniff window: magic bytes then cost no extra round trip, and an extension lies both ways -
+ * a PNG named `.dat` used to arrive as pages of binary text, a text file named `.png` as an
+ * attachment nothing could decode. The map lives for one tool call, so an answer cannot outlive
+ * the read it was taken for.
+ */
 function createRemoteReadOps(target: ActiveSshTarget, signal?: AbortSignal): ReadOperations {
+	const sniffed = new Map<string, string | null>();
+	const headCommand = (path: string) => `head -c ${IMAGE_SNIFF_BYTES} ${shellQuote(path)}`;
 	return {
 		readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`, { signal }),
-		access: (absolutePath) => sshOk(target.remote, remoteAccessCheck(absolutePath, false), { signal }).then(() => {}),
-		detectImageMimeType: async (absolutePath) => inferImageMimeType(absolutePath),
+		access: async (absolutePath) => {
+			// The checks exit the remote shell on the first failure, so `head` only runs on a file
+			// that is really there and really readable.
+			const head = await sshOk(target.remote, `${remoteAccessCheck(absolutePath, false)}; ${headCommand(absolutePath)}`, { signal });
+			sniffed.set(absolutePath, sniffImageMimeType(head));
+		},
+		detectImageMimeType: async (absolutePath) => {
+			const cached = sniffed.get(absolutePath);
+			if (cached !== undefined) {
+				sniffed.delete(absolutePath);
+				return cached;
+			}
+			return sniffImageMimeType(await sshOk(target.remote, headCommand(absolutePath), { signal }));
+		},
 	};
 }
 
