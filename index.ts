@@ -16,6 +16,10 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
+	formatReadLineRange,
+	getLanguageFromPath,
+	highlightCode,
+	keyHint,
 	type ReadOperations,
 	renderDiff,
 	type SessionEntry,
@@ -1149,6 +1153,76 @@ function renderSshEditResultBody(result: SshEditToolResult, theme: Theme, contex
 	return component;
 }
 
+/**
+ * The `write` row previews the content it is about to put on disk: ten lines collapsed, all of it
+ * after Ctrl+O. That preview is drawn by the call renderer, not the result renderer, so a tool that
+ * replaces the call renderer has to draw it again - otherwise its row shows a title at every width
+ * and Ctrl+O opens nothing.
+ */
+const SSH_WRITE_PREVIEW_LINES = 10;
+
+type SshWriteCallComponent = Text & { preview?: { source: string; lang: string | undefined; lines: string[] } };
+type SshWriteRenderContext = { lastComponent: unknown; expanded: boolean };
+
+function trimTrailingEmptyLines(lines: string[]): string[] {
+	let end = lines.length;
+	while (end > 0 && lines[end - 1] === "") {
+		end -= 1;
+	}
+	return lines.slice(0, end);
+}
+
+/** Highlighted once per content, then reused: a repaint of the same call must not re-run shiki. */
+function sshWritePreviewLines(content: string, lang: string | undefined, component: SshWriteCallComponent): string[] {
+	const cached = component.preview;
+	if (cached && cached.source === content && cached.lang === lang) {
+		return cached.lines;
+	}
+	const normalized = content.replace(/\r/g, "");
+	const lines = trimTrailingEmptyLines(lang ? highlightCode(normalized, lang) : normalized.split("\n"));
+	component.preview = { source: content, lang, lines };
+	return lines;
+}
+
+function renderSshWriteCall(
+	args: unknown,
+	theme: Theme,
+	context: SshWriteRenderContext,
+	target: ActiveSshTarget | null,
+): SshWriteCallComponent {
+	const input = (args ?? {}) as { path?: unknown; content?: unknown };
+	const path = typeof input.path === "string" ? input.path : "";
+	const component = (
+		context.lastComponent instanceof Text
+			? (context.lastComponent as SshWriteCallComponent)
+			: new Text("", 0, 0)
+	) as SshWriteCallComponent;
+	const title =
+		`${theme.fg("toolTitle", theme.bold("ssh_write"))} ${theme.fg("accent", path || "...")} ` +
+		theme.fg("muted", `[${target ? target.name : "inactive"}]`);
+	// Same three cases the write row has: no content argument yet, empty content, real content.
+	const content = input.content === undefined ? "" : typeof input.content === "string" ? input.content : null;
+	if (content === null) {
+		component.setText(`${title}\n\n${theme.fg("error", "[invalid content arg - expected string]")}`);
+		return component;
+	}
+	if (!content) {
+		component.setText(title);
+		return component;
+	}
+	const lang = path ? getLanguageFromPath(path) : undefined;
+	const lines = sshWritePreviewLines(content, lang, component);
+	const shown = context.expanded ? lines.length : Math.min(lines.length, SSH_WRITE_PREVIEW_LINES);
+	const body = lines
+		.slice(0, shown)
+		.map((line) => (lang ? line : theme.fg("toolOutput", line.replace(/\t/g, "   "))))
+		.join("\n");
+	const hidden = lines.length - shown;
+	const hint = hidden > 0 ? `${theme.fg("muted", `\n... (${hidden} more lines, ${lines.length} total,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}` : "";
+	component.setText(`${title}\n\n${body}${hint}`);
+	return component;
+}
+
 function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
@@ -1428,9 +1502,12 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
+			const range = formatReadLineRange(args?.offset, args?.limit);
 			const targetLabel = activeTarget ? activeTarget.name : "inactive";
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("ssh_read"))} ${theme.fg("accent", path)} ${theme.fg("muted", `[${targetLabel}]`)}`,
+				`${theme.fg("toolTitle", theme.bold("ssh_read"))} ${theme.fg("accent", path)}` +
+					(range ? theme.fg("warning", range) : "") +
+					` ${theme.fg("muted", `[${targetLabel}]`)}`,
 				0,
 				0,
 			);
@@ -1452,14 +1529,8 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			const tool = createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target, signal) });
 			return tool.execute(toolCallId, { ...params, path }, signal, onUpdate, withCwd(ctx, target.remoteCwd));
 		},
-		renderCall(args, theme) {
-			const path = typeof args?.path === "string" ? args.path : "...";
-			const targetLabel = activeTarget ? activeTarget.name : "inactive";
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("ssh_write"))} ${theme.fg("accent", path)} ${theme.fg("muted", `[${targetLabel}]`)}`,
-				0,
-				0,
-			);
+		renderCall(args, theme, context) {
+			return renderSshWriteCall(args, theme, context as unknown as SshWriteRenderContext, activeTarget);
 		},
 		renderResult: writeBase.renderResult,
 	});
