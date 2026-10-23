@@ -1,0 +1,25 @@
+#!/bin/sh
+# A stand-in for /usr/bin/ssh, found first on PATH while the tests run.
+#
+# The plugin builds one `ssh <remote> <command>` per call and takes the last argument as the
+# command to run remotely. Here the "remote" filesystem is this machine, with the remote tree at
+# a real local path, so evaluating those bytes reproduces what a remote shell would do with them
+# - including the shell flags, quoting, and exit codes the tests are about.
+#
+# FAKE_REMOTE_HOME stands in for the remote user's home directory.
+# FAKE_SSH_LOG, when set, collects one entry per call so a test can count round trips.
+
+command=""
+for argument in "$@"; do
+	command=$argument
+done
+
+if [ -n "$FAKE_SSH_LOG" ]; then
+	printf '%s\n' "$command" >>"$FAKE_SSH_LOG"
+fi
+
+case $command in
+'printf %s "$HOME"') printf '%s' "$FAKE_REMOTE_HOME" ;;
+pwd) printf '%s\n' "$FAKE_REMOTE_HOME" ;;
+*) eval "$command" ;;
+esac

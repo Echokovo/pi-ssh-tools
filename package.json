@@ -3,6 +3,9 @@
   "version": "0.2.4",
   "description": "Explicit SSH tools for pi. Toggle /ssh on for a host, then use ssh_read, ssh_write, ssh_edit, and ssh_bash without replacing local tools. Your own ! and !! commands follow the active host; prefix one with local: to keep it local.",
   "type": "module",
+  "scripts": {
+    "test": "node --import ./test/support/register.mjs --test test/*.test.mts"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

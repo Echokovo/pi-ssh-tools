@@ -174,6 +174,39 @@ That is the whole call — host, exit code, duration, the command that ran, and 
 said — including the background probes and calls that never reached a tool. File content
 is never written to it. Unset the variable and nothing is logged.
 
+## Tests
+
+```bash
+npm test
+```
+
+Runs in a few seconds and needs Node 23 or newer: the suite loads the extension's TypeScript
+directly, the way pi loads it, so there is nothing to build first.
+
+Nothing is installed and no host is contacted. `test/fixtures/ssh` is a stand-in `ssh` that runs
+the command it is handed against the local filesystem, and every test gets its own file trees
+under the system temp directory — one standing in for the remote home, one for the local one.
+That is what makes the comparisons worth having: an `ssh_read` and a `read` of the same file have
+to answer the same way, and a difference between them is only interesting if both sides really
+ran. Seven cases are recorded as ones that cannot match — four where a remote shell words an error
+differently from a local syscall, two where the file is on the host and nowhere locally, one where
+the shell blames a different line number — and the suite fails if one of them starts matching, so
+that list cannot drift.
+
+The pieces live in `test/support/harness.mts`:
+
+- `createWorkspace()` / `resetWorkspace()` — the file trees, reset before each side of a comparison so one case cannot leave state for the next
+- `useFakeRemoteHost()` — puts the stand-in `ssh` first on `PATH` and points `HOME` at a directory with no ssh config in it, so nothing reads your real one
+- `loadExtension()` — loads `index.ts` the way pi loads it and hands back the tools and commands it registered
+- `activateSsh()` / `runSshCommand()` — drive `/ssh`, the only way the extension gains or loses a host
+- `runTool()` — call a tool the way pi calls it and flatten what came back
+- `toolRow()` — draw a tool row through pi's own `ToolExecutionComponent`, the only way to compare a row with the native row it is meant to look like
+- `comparable()` — blank out what cannot match between two machines: the two path roots, temp file names, timings
+- `piImport()` — reach a module inside pi by path, so the classes a test uses are the classes pi uses
+
+The pi install to test against is looked for in this order: `PI_CODING_AGENT_DIR`, normal Node
+resolution (after `npm install`), then the usual global install locations.
+
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi)
