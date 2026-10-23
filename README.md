@@ -163,8 +163,8 @@ Host *
 PI_SSH_TOOLS_DEBUG=1 pi
 ```
 
-Every `ssh` call then appends one line to `pi-ssh-tools.log` in your temp directory
-(`/tmp/pi-ssh-tools.log`):
+Every `ssh` call, and any `ssh_edit` row whose renderer failed, appends one line to
+`pi-ssh-tools.log` in your temp directory (`/tmp/pi-ssh-tools.log`):
 
 ```
 2026-10-18T14:31:52.002Z mac exit=1 1ms cmd="if [ ! -e '/home/lin/notes.md' ]; ..." stderr="no such file: /home/lin/notes.md"

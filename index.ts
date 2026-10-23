@@ -1013,19 +1013,11 @@ function setSshEditPreview(component: SshEditCallComponent, preview: SshEditPrev
 /**
  * Evidence for a failing renderer. pi catches anything a renderer throws and re-renders the row
  * with a bare Text; for a self-shell tool that fallback has no frame at all, so the row would
- * lose its background in complete silence.
+ * lose its background in complete silence. It goes to the same opt-in file as the call log: a
+ * row that fails on every repaint would otherwise append to a file nobody asked for.
  */
-const sshEditRenderLogPath = "/tmp/pi-ssh-edit-render.log";
-
 function logSshEditRenderError(where: string, error: unknown): void {
-	try {
-		appendFileSync(
-			sshEditRenderLogPath,
-			`${new Date().toISOString()} ${where}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
-		);
-	} catch {
-		// Evidence is best effort; a row that failed once must not fail twice.
-	}
+	logSshCall(`${where}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
 }
 
 /** The frame survives any renderer failure: the reason goes inside it instead of replacing it. */
