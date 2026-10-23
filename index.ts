@@ -22,7 +22,7 @@ import {
 	type Theme,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Box, type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 type SshProfile = {
 	name: string;
@@ -1009,6 +1009,58 @@ function setSshEditPreview(component: SshEditCallComponent, preview: SshEditPrev
 	return changed;
 }
 
+/**
+ * Evidence for a failing renderer. pi catches anything a renderer throws and re-renders the row
+ * with a bare Text; for a self-shell tool that fallback has no frame at all, so the row would
+ * lose its background in complete silence.
+ */
+const sshEditRenderLogPath = "/tmp/pi-ssh-edit-render.log";
+
+function logSshEditRenderError(where: string, error: unknown): void {
+	try {
+		appendFileSync(
+			sshEditRenderLogPath,
+			`${new Date().toISOString()} ${where}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+		);
+	} catch {
+		// Evidence is best effort; a row that failed once must not fail twice.
+	}
+}
+
+/** The frame survives any renderer failure: the reason goes inside it instead of replacing it. */
+function buildSshEditErrorFrame(theme: Theme, outputPad: number, error: unknown): Box {
+	const component = new Box(1, 1, (text) => theme.bg("toolErrorBg", text));
+	component.setPaddingX(outputPad);
+	component.addChild(
+		new Text(
+			`${theme.fg("toolTitle", theme.bold("ssh_edit"))} ${theme.fg("error", error instanceof Error ? error.message : String(error))}`,
+			0,
+			0,
+		),
+	);
+	return component;
+}
+
+function renderSshEditCall(args: unknown, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): Component {
+	try {
+		return renderSshEditCallBody(args, theme, context, target);
+	} catch (error) {
+		logSshEditRenderError("renderCall", error);
+		return buildSshEditErrorFrame(theme, context.outputPad, error);
+	}
+}
+
+function renderSshEditResult(result: SshEditToolResult, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): Container {
+	try {
+		return renderSshEditResultBody(result, theme, context, target);
+	} catch (error) {
+		logSshEditRenderError("renderResult", error);
+		const component = new Container();
+		component.addChild(new Text(theme.fg("error", error instanceof Error ? error.message : String(error)), context.outputPad, 0));
+		return component;
+	}
+}
+
 /** The framed row: the title line, then the diff or the reason there is none, all on the tool background. */
 function buildSshEditCallComponent(
 	component: SshEditCallComponent,
@@ -1037,7 +1089,7 @@ function buildSshEditCallComponent(
 	return component;
 }
 
-function renderSshEditCall(args: unknown, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): SshEditCallComponent {
+function renderSshEditCallBody(args: unknown, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): SshEditCallComponent {
 	const component = getSshEditCallComponent(context);
 	const input = getRenderableEditInput(args);
 	const argsKey = editPreviewArgsKey(input);
@@ -1060,7 +1112,7 @@ function renderSshEditCall(args: unknown, theme: Theme, context: SshEditRenderCo
 			if (setSshEditPreview(component, preview, requestKey)) {
 				context.invalidate();
 			}
-		});
+		}).catch((error) => logSshEditRenderError("preview", error));
 	}
 	return buildSshEditCallComponent(component, args, theme, target ? target.name : "inactive", context.outputPad);
 }
@@ -1070,7 +1122,7 @@ function renderSshEditCall(args: unknown, theme: Theme, context: SshEditRenderCo
  * call; only an error the preview did not already show gets a line of its own, and it sits
  * outside the frame exactly as pi's edit renderer leaves it.
  */
-function renderSshEditResult(result: SshEditToolResult, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): Container {
+function renderSshEditResultBody(result: SshEditToolResult, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): Container {
 	const callComponent = context.state.callComponent;
 	const argsKey = editPreviewArgsKey(getRenderableEditInput(context.args));
 	const details = result.details as EditToolDetails | undefined;
