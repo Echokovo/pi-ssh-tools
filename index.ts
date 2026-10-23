@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { extname, isAbsolute, join, relative, sep } from "node:path";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	type BashOperations,
 	createBashToolDefinition,
@@ -12,14 +12,17 @@ import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	type EditOperations,
+	type EditToolDetails,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	type ReadOperations,
+	renderDiff,
 	type SessionEntry,
+	type Theme,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 type SshProfile = {
 	name: string;
@@ -846,6 +849,261 @@ function createRemoteEditOps(target: ActiveSshTarget, localCwd: string, signal?:
 	};
 }
 
+/**
+ * The diff an `ssh_edit` call would produce, or the reason it could not be computed. The same
+ * shape pi's own edit preview has, so the renderer treats a preview and a result alike.
+ */
+type SshEditPreview = { diff: string; firstChangedLine?: number } | { error: string };
+
+/**
+ * pi's edit renderer keeps its preview bookkeeping on the Box it draws, and the tool row hands
+ * that Box back through `context.lastComponent`. The remote renderer keeps the same fields, so
+ * the frame, the streaming preview, and the settled diff all update one component.
+ */
+type SshEditCallComponent = Box & {
+	preview?: SshEditPreview;
+	previewArgsKey?: string;
+	previewPending?: boolean;
+	settledError?: boolean;
+};
+
+/** The part of pi's tool render context this renderer reads; `ToolRenderContext` is not exported. */
+type SshEditRenderContext = {
+	args: unknown;
+	invalidate: () => void;
+	lastComponent: unknown;
+	state: { callComponent?: SshEditCallComponent };
+	executionStarted: boolean;
+	argsComplete: boolean;
+	isError: boolean;
+	outputPad: number;
+};
+
+/** The part of pi's tool result this renderer reads. */
+type SshEditToolResult = {
+	content: { type: string; text?: string }[];
+	details?: unknown;
+};
+
+type SshEditInput = { path: string; edits: { oldText: string; newText: string }[] };
+
+/**
+ * The edit arguments a diff can be computed from, accepting every shape pi accepts: the
+ * `edits[]` array, the legacy single `oldText`/`newText` pair, and `file_path`.
+ */
+function getRenderableEditInput(args: unknown): SshEditInput | null {
+	const value = args as { path?: unknown; file_path?: unknown; edits?: unknown; oldText?: unknown; newText?: unknown } | undefined;
+	if (!value) {
+		return null;
+	}
+	const path = typeof value.path === "string" ? value.path : typeof value.file_path === "string" ? value.file_path : null;
+	if (!path) {
+		return null;
+	}
+	if (
+		Array.isArray(value.edits) &&
+		value.edits.length > 0 &&
+		value.edits.every((edit) => {
+			const entry = edit as { oldText?: unknown; newText?: unknown } | null;
+			return typeof entry?.oldText === "string" && typeof entry?.newText === "string";
+		})
+	) {
+		return { path, edits: value.edits as SshEditInput["edits"] };
+	}
+	if (typeof value.oldText === "string" && typeof value.newText === "string") {
+		return { path, edits: [{ oldText: value.oldText, newText: value.newText }] };
+	}
+	return null;
+}
+
+/** The key pi's edit preview uses to decide whether the arguments moved. Host is left out on purpose: a
+ *  settled row keeps its diff when `/ssh off` later changes the label next to it. */
+function editPreviewArgsKey(input: SshEditInput | null): string | undefined {
+	return input ? JSON.stringify({ path: input.path, edits: input.edits }) : undefined;
+}
+
+/**
+ * The diff an `ssh_edit` call would produce, without writing to the host.
+ *
+ * pi previews a local edit by reading the file off disk; the pre-edit bytes of a remote edit
+ * only exist on the host, so the preview pays for the one `cat` that read would have been. The
+ * diff itself comes from pi's own edit tool run with write operations that capture instead of
+ * upload, so the preview cannot drift from the real call: BOM, line endings, and fuzzy matching
+ * all stay pi's code.
+ */
+async function computeRemoteEditPreview(target: ActiveSshTarget, input: SshEditInput): Promise<SshEditPreview> {
+	try {
+		const localCwd = process.cwd();
+		// The same path maths the real call does, so the preview reads the file the edit will write.
+		const editPath = toLocalEditPath(await expandRemoteTilde("ssh_edit", input.path, target), target.remoteCwd);
+		const remotePath = toRemotePath(resolve(localCwd, editPath), localCwd, target.remoteCwd);
+		const content = await sshOk(target.remote, `cat ${shellQuote(remotePath)}`);
+		const tool = createEditToolDefinition(localCwd, {
+			operations: {
+				access: async () => {},
+				readFile: async () => content,
+				writeFile: async () => {},
+			},
+		});
+		const result = await tool.execute(
+			"ssh_edit_preview",
+			{ path: editPath, edits: input.edits },
+			undefined,
+			undefined,
+			{ cwd: localCwd } as unknown as Parameters<typeof tool.execute>[4],
+		);
+		const details = result.details as EditToolDetails | undefined;
+		if (typeof details?.diff !== "string") {
+			return { error: `Could not preview the remote edit of ${input.path}.` };
+		}
+		return { diff: details.diff, firstChangedLine: details.firstChangedLine };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+function getEditHeaderBg(preview: SshEditPreview | undefined, settledError: boolean | undefined, theme: Theme): (text: string) => string {
+	if (preview) {
+		return "error" in preview ? (text) => theme.bg("toolErrorBg", text) : (text) => theme.bg("toolSuccessBg", text);
+	}
+	if (settledError) {
+		return (text) => theme.bg("toolErrorBg", text);
+	}
+	return (text) => theme.bg("toolPendingBg", text);
+}
+
+/** Reuse the Box this row drew before, so a streaming call repaints one component instead of allocating per frame. */
+function getSshEditCallComponent(context: SshEditRenderContext): SshEditCallComponent {
+	if (context.lastComponent instanceof Box) {
+		const component = context.lastComponent as SshEditCallComponent;
+		context.state.callComponent = component;
+		return component;
+	}
+	if (context.state.callComponent) {
+		return context.state.callComponent;
+	}
+	const component: SshEditCallComponent = Object.assign(new Box(1, 1, (text) => text), {
+		preview: undefined,
+		previewArgsKey: undefined,
+		previewPending: false,
+		settledError: false,
+	});
+	context.state.callComponent = component;
+	return component;
+}
+
+/** Whether the framed body changed enough to redraw, with pi's own comparison. */
+function setSshEditPreview(component: SshEditCallComponent, preview: SshEditPreview, argsKey: string | undefined): boolean {
+	const current = component.preview;
+	const changed =
+		current === undefined ||
+		("error" in current && "error" in preview
+			? current.error !== preview.error
+			: "error" in current !== "error" in preview) ||
+		(!("error" in current) &&
+			!("error" in preview) &&
+			(current.diff !== preview.diff || current.firstChangedLine !== preview.firstChangedLine));
+	component.preview = preview;
+	component.previewArgsKey = argsKey;
+	component.previewPending = false;
+	return changed;
+}
+
+/** The framed row: the title line, then the diff or the reason there is none, all on the tool background. */
+function buildSshEditCallComponent(
+	component: SshEditCallComponent,
+	args: unknown,
+	theme: Theme,
+	targetLabel: string,
+	outputPad: number,
+): SshEditCallComponent {
+	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
+	component.setPaddingX(outputPad);
+	component.clear();
+	const path = getRenderableEditInput(args)?.path ?? "...";
+	component.addChild(
+		new Text(
+			`${theme.fg("toolTitle", theme.bold("ssh_edit"))} ${theme.fg("accent", path)} ${theme.fg("muted", `[${targetLabel}]`)}`,
+			0,
+			0,
+		),
+	);
+	if (!component.preview) {
+		return component;
+	}
+	const body = "error" in component.preview ? theme.fg("error", component.preview.error) : renderDiff(component.preview.diff);
+	component.addChild(new Spacer(1));
+	component.addChild(new Text(body, 0, 0));
+	return component;
+}
+
+function renderSshEditCall(args: unknown, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): SshEditCallComponent {
+	const component = getSshEditCallComponent(context);
+	const input = getRenderableEditInput(args);
+	const argsKey = editPreviewArgsKey(input);
+	if (component.previewArgsKey !== argsKey) {
+		component.preview = undefined;
+		component.previewArgsKey = argsKey;
+		component.previewPending = false;
+		component.settledError = false;
+	}
+	// The preview is a remote read, so it runs once per argument set, only while the call is
+	// still streaming (a settled row takes its diff from the result instead), only before the
+	// call starts (the file changes under it), and only with a host to read from.
+	if (context.argsComplete && !context.executionStarted && target && input && !component.preview && !component.previewPending) {
+		component.previewPending = true;
+		const requestKey = argsKey;
+		void computeRemoteEditPreview(target, input).then((preview) => {
+			if (component.previewArgsKey !== requestKey) {
+				return;
+			}
+			if (setSshEditPreview(component, preview, requestKey)) {
+				context.invalidate();
+			}
+		});
+	}
+	return buildSshEditCallComponent(component, args, theme, target ? target.name : "inactive", context.outputPad);
+}
+
+/**
+ * The result row. The diff belongs inside the frame above, so this stays empty for a successful
+ * call; only an error the preview did not already show gets a line of its own, and it sits
+ * outside the frame exactly as pi's edit renderer leaves it.
+ */
+function renderSshEditResult(result: SshEditToolResult, theme: Theme, context: SshEditRenderContext, target: ActiveSshTarget | null): Container {
+	const callComponent = context.state.callComponent;
+	const argsKey = editPreviewArgsKey(getRenderableEditInput(context.args));
+	const details = result.details as EditToolDetails | undefined;
+	const resultDiff = context.isError ? undefined : details?.diff;
+	let changed = false;
+	if (callComponent) {
+		if (typeof resultDiff === "string") {
+			changed =
+				setSshEditPreview(callComponent, { diff: resultDiff, firstChangedLine: details?.firstChangedLine }, argsKey) || changed;
+		}
+		if (callComponent.settledError !== context.isError) {
+			callComponent.settledError = context.isError;
+			changed = true;
+		}
+		if (changed) {
+			buildSshEditCallComponent(callComponent, context.args, theme, target ? target.name : "inactive", context.outputPad);
+		}
+	}
+	const component = context.lastComponent instanceof Container ? context.lastComponent : new Container();
+	component.clear();
+	const preview = callComponent?.preview;
+	const previewError = preview && "error" in preview ? preview.error : undefined;
+	const errorText = result.content
+		.filter((part) => part.type === "text")
+		.map((part) => part.text ?? "")
+		.join("\n");
+	if (context.isError && errorText && errorText !== previewError) {
+		component.addChild(new Spacer(1));
+		component.addChild(new Text(theme.fg("error", errorText), context.outputPad, 0));
+	}
+	return component;
+}
+
 function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
@@ -1186,16 +1444,14 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, localCwd, signal) });
 			return tool.execute(toolCallId, transformedParams, signal, onUpdate, withCwd(ctx, localCwd));
 		},
-		renderCall(args, theme) {
-			const path = typeof args?.path === "string" ? args.path : "...";
-			const targetLabel = activeTarget ? activeTarget.name : "inactive";
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("ssh_edit"))} ${theme.fg("accent", path)} ${theme.fg("muted", `[${targetLabel}]`)}`,
-				0,
-				0,
-			);
+		// pi's edit tool draws its own frame (`renderShell: "self"`), so this one has to as well:
+		// a bare Text here would leave the row with neither the default shell's background nor its own.
+		renderCall(args, theme, context) {
+			return renderSshEditCall(args, theme, context as unknown as SshEditRenderContext, activeTarget);
 		},
-		renderResult: editBase.renderResult,
+		renderResult(result, _options, theme, context) {
+			return renderSshEditResult(result as unknown as SshEditToolResult, theme, context as unknown as SshEditRenderContext, activeTarget);
+		},
 	});
 
 	pi.registerTool({
