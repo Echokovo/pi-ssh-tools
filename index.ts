@@ -1756,11 +1756,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		// workspace and /resume reads the historical file; only /new and /reload start
 		// from an empty branch and fall back to the in-process handoff slot.
 		const recorded = findSessionState(ctx.sessionManager.getBranch());
-		const inherited =
-			recorded ??
-			(event.reason === "new" || event.reason === "reload" || event.reason === "fork"
-				? readHandoff(ctx.cwd)
-				: null);
+		const startsEmpty = event.reason === "new" || event.reason === "reload" || event.reason === "fork";
+		const handed = startsEmpty ? readHandoff(ctx.cwd) : null;
+		// A handoff carries a live workspace, and only a live one. `/ssh off` closes a workspace for
+		// good: its record stays in the session file that recorded it, where /resume and /fork read
+		// it back, and passing an off record to the next session would bind that one, and every one
+		// after it, to a host nobody has open. This clears a slot an older version left behind.
+		if (handed && !handed.active) {
+			writeHandoff(ctx.cwd, null);
+		}
+		const inherited = recorded ?? (handed?.active ? handed : null);
 
 		// Whatever notice the previous session put up is about a workspace this session
 		// has not looked at yet.
@@ -1919,11 +1924,14 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		integrationAttempted = false;
 		permissionGateState = "pending";
 
-		// /new, /fork, and /reload can start from a file that does not carry our entry, so
-		// hand the workspace to the next session in this process. /resume must not: the
-		// historical session's own record decides there. Quitting must not either - a new
-		// pi process starts with an empty slot, which keeps SSH mode off after a restart.
-		const carry = event.reason === "new" || event.reason === "fork" || event.reason === "reload";
+		// /new, /fork, and /reload can start from a file that does not carry our entry, so hand the
+		// workspace to the next session in this process - a live one only. `/ssh off` closes a
+		// workspace and ends its lifecycle there: the off record belongs to the session file that
+		// recorded it, and an empty slot keeps /new from carrying one host into session after session.
+		// /resume must not hand anything on: the historical session's own record decides there.
+		// Quitting must not either - a new pi process starts with an empty slot, which keeps SSH mode
+		// off after a restart.
+		const carry = activeTarget !== null && (event.reason === "new" || event.reason === "fork" || event.reason === "reload");
 		writeHandoff(ctx.cwd, carry ? snapshotState() : null);
 	});
 }

@@ -367,3 +367,145 @@ export function privateTmpDir(prefix: string): string {
 	process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 	return dir;
 }
+
+/**
+ * One session generation, as the session lifecycle handlers see it: what its branch carries, which
+ * tools pi has active, and what the extension put in front of the user.
+ */
+export type LiveSession = {
+	cwd: string;
+	/** What `sessionManager.getBranch()` reports: the entries from the root to the current leaf. */
+	branch: any[];
+	tools: Map<string, any>;
+	activeTools: string[];
+	notices: Array<{ message: string; level: string | undefined }>;
+	/** One row per `ui.setStatus` call, newest last; `undefined` is the row being cleared. */
+	statuses: Array<string | undefined>;
+	/** One row per `ui.setWidget` call, newest last; `undefined` lines are the widget being cleared. */
+	widgets: Array<{ key: string; lines: string[] | undefined }>;
+	commands: Map<string, any>;
+};
+
+/**
+ * The extension held the way a running pi holds it: pi builds a new runtime for every session
+ * generation, so each generation gets a fresh registration and only the session file and the
+ * in-process handoff slot can cross from one to the next.
+ */
+export async function loadLivePi(): Promise<{
+	start: (reason: string, options: { cwd: string; branch?: any[] }) => Promise<LiveSession>;
+	shutdown: (session: LiveSession, reason: string) => Promise<void>;
+	replace: (session: LiveSession, reason: "new" | "fork" | "resume") => Promise<LiveSession>;
+	ssh: (session: LiveSession, input: string) => Promise<void>;
+}> {
+	const extension = await import("../../index.ts");
+	const theme = await piTheme();
+	const handlers = new Map<LiveSession, Map<string, Array<(event: any, ctx: any) => any>>>();
+
+	const contextOf = (session: LiveSession) => ({
+		cwd: session.cwd,
+		hasUI: false,
+		ui: {
+			notify: (message: string, level?: string) => {
+				session.notices.push({ message, level });
+			},
+			theme,
+			setWidget: (key: string, lines: string[] | undefined) => {
+				session.widgets.push({ key, lines });
+			},
+			setStatus: (_key: string, text: string | undefined) => {
+				session.statuses.push(text);
+			},
+			setFooter: () => {},
+			setEditorText: () => {},
+			getEditorContent: () => "",
+			on: () => () => {},
+			addAutocompleteProvider: () => {},
+			custom: () => undefined,
+			select: async () => undefined,
+		},
+		sessionManager: {
+			getBranch: () => session.branch,
+			getSessionId: () => "live-session",
+			getSessionFile: () => undefined,
+		},
+		abortController: new AbortController(),
+		isIdle: () => true,
+		model: { id: "test", provider: "test" },
+	});
+
+	const fire = async (session: LiveSession, type: string, event: any) => {
+		for (const handler of handlers.get(session)?.get(type) ?? []) {
+			await handler(event, contextOf(session));
+		}
+	};
+
+	return {
+		/**
+		 * Register a fresh extension instance and announce the start. The branch stands for what the
+		 * new session file carries, which is what separates `/fork` and `/resume` from `/new`.
+		 */
+		async start(reason, { cwd, branch = [] }) {
+			const session: LiveSession = {
+				cwd,
+				branch,
+				tools: new Map(),
+				activeTools: [],
+				notices: [],
+				statuses: [],
+				widgets: [],
+				commands: new Map(),
+			};
+			const registry = new Map<string, Array<(event: any, ctx: any) => any>>();
+			handlers.set(session, registry);
+			extension.default({
+				registerTool: (definition: any) => {
+					session.tools.set(definition.name, definition);
+				},
+				registerCommand: (name: string, options: any) => {
+					session.commands.set(name, options);
+				},
+				registerShortcut: () => {},
+				on: (name: string, handler: (event: any, ctx: any) => any) => {
+					const list = registry.get(name) ?? [];
+					list.push(handler);
+					registry.set(name, list);
+				},
+				setActiveTools: (tools: string[]) => {
+					session.activeTools = [...tools];
+				},
+				getActiveTools: () => [...session.activeTools],
+				getSettings: () => ({}),
+				appendEntry: (customType: string, data: unknown) => {
+					session.branch.push({ type: "custom", customType, data });
+				},
+				events: { on: () => () => {}, emit: () => {} },
+			} as any);
+			await fire(session, "session_start", { type: "session_start", reason });
+			return session;
+		},
+
+		async shutdown(session, reason) {
+			await fire(session, "session_shutdown", { type: "session_shutdown", reason });
+		},
+
+		/**
+		 * Replace the session the way pi does: shut the current generation down, then start the next
+		 * one. `/fork` and `/clone` copy the branch; `/new` and a fresh process start from none.
+		 */
+		async replace(session, reason) {
+			await this.shutdown(session, reason);
+			return this.start(reason, { cwd: session.cwd, branch: reason === "new" ? [] : [...session.branch] });
+		},
+
+		async ssh(session, input) {
+			await session.commands.get("ssh").handler(input, contextOf(session));
+		},
+	};
+}
+
+/** The workspace an entry recorded, in the shape the session file holds it. */
+export function recordedStates(session: LiveSession): Array<{ active: boolean; name: string; remoteCwd: string }> {
+	return session.branch
+		.filter((entry: any) => entry.type === "custom" && entry.customType === "pi-ssh-tools:target")
+		.map((entry: any) => entry.data);
+}

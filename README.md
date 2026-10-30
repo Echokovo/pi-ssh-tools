@@ -98,7 +98,8 @@ Connecting records the host and the remote cwd into the session, so the workspac
 - `/resume`, `/fork`, and `/clone` come back with the same host and remote cwd
 - `/new` and `/reload` inherit the workspace from the session you were just in
 - `/tree` switches to the workspace the point you move to recorded, and keeps the one you are on when that point recorded none — stepping back one node does not drop the connection
-- `/ssh off` is recorded too, so a later session does not resurrect a workspace you closed on purpose
+- `/ssh off` is recorded too, so `/resume` and `/fork` of the branch that recorded it do not resurrect a workspace you closed on purpose
+- closing also ends it: the session `/new` starts after an `/ssh off` has no workspace, says nothing about one, and hands nothing to the session after it
 - a fresh session with no history starts off and writes nothing
 
 `/ssh status` names where the current workspace came from: this session, the session file, or the previous session.
@@ -198,6 +199,7 @@ The pieces live in `test/support/harness.mts`:
 - `createWorkspace()` / `resetWorkspace()` — the file trees, reset before each side of a comparison so one case cannot leave state for the next
 - `useFakeRemoteHost()` — puts the stand-in `ssh` first on `PATH` and points `HOME` at a directory with no ssh config in it, so nothing reads your real one
 - `loadExtension()` — loads `index.ts` the way pi loads it and hands back the tools and commands it registered
+- `loadLivePi()` — a run of pi session generations: every `/new`, `/fork`, `/resume`, and quit registers a fresh extension instance and a fresh branch, so only what a session file or the in-process handoff really carries can cross from one to the next
 - `activateSsh()` / `runSshCommand()` — drive `/ssh`, the only way the extension gains or loses a host
 - `runTool()` — call a tool the way pi calls it and flatten what came back
 - `toolRow()` — draw a tool row through pi's own `ToolExecutionComponent`, the only way to compare a row with the native row it is meant to look like
