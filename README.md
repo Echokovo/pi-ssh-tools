@@ -86,6 +86,8 @@ To run one command locally while SSH mode is on, prefix it with `local:`:
 
 The marker is stripped before execution. It only applies while SSH mode is on: with SSH mode off this package does not intercept `!` and `!!` at all, so `local:` reaches your shell as a command name. You get a warning before that happens.
 
+The model is not told about any of this. `!`, `!!`, and the `local:` marker belong to your terminal; the system prompt the agent gets names the host, the remote cwd, and the four `ssh_*` tools, so nothing about commands you type yourself leaks into its context.
+
 Two details worth knowing:
 
 - `shellCommandPrefix` from settings is dropped for remote commands, because it usually sources local shell setup such as `~/.bash_aliases`. It still applies to `local:` commands.

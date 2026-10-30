@@ -13,6 +13,8 @@ const FAKE_SSH_DIR = new URL("../fixtures", import.meta.url).pathname;
 export type Captured = {
 	tools: Map<string, any>;
 	commands: Map<string, any>;
+	/** Handlers by pi event name, so a test can fire an event and read what the extension answers. */
+	handlers: Map<string, Array<(event: any, ctx: any) => any>>;
 };
 
 export type Workspace = {
@@ -157,14 +159,18 @@ export function useFakeRemoteHost(workspace: Workspace): void {
 
 /** Load the extension the way pi does - as the default export handed an extension API. */
 export async function loadExtension(): Promise<Captured> {
-	const captured: Captured = { tools: new Map(), commands: new Map() };
+	const captured: Captured = { tools: new Map(), commands: new Map(), handlers: new Map() };
 	const noop = () => {};
 	const extension = await import("../../index.ts");
 	extension.default({
 		registerTool: (definition: any) => captured.tools.set(definition.name, definition),
 		registerCommand: (name: string, options: any) => captured.commands.set(name, options),
 		registerShortcut: noop,
-		on: noop,
+		on: (name: string, handler: (event: any, ctx: any) => any) => {
+			const list = captured.handlers.get(name) ?? [];
+			list.push(handler);
+			captured.handlers.set(name, list);
+		},
 		setActiveTools: noop,
 		getActiveTools: () => [],
 		getSettings: () => ({}),

@@ -1848,8 +1848,11 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		// The notice above the editor covers the moment before the user acts. Once a turn
-		// starts, the footer and the per-turn system prompt say the same thing.
+		// The notice above the editor covers the moment before the user acts, and it is
+		// user-facing only. Once a turn starts, the footer keeps naming the host and the
+		// per-turn system prompt tells the model which tools to reach for. What `!` and `!!`
+		// do, and the `local:` marker that overrides it, stay out of the model's context:
+		// only the user's terminal types those.
 		hideWorkspaceNotice(ctx);
 		if (!activeTarget) {
 			return;
@@ -1857,7 +1860,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote working directory: ${activeTarget.remoteCwd}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.\nBash commands the user runs with ! or !! also execute on the remote host in the remote working directory, unless the command starts with "local:".`,
+				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote working directory: ${activeTarget.remoteCwd}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.`,
 		};
 	});
 
