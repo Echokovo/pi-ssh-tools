@@ -32,6 +32,11 @@ type SshProfile = {
 	cwd?: string;
 };
 
+/**
+ * The workspace SSH mode is on. `remote` is what `ssh` is handed and what every screen names, so a
+ * target typed `/ssh mac:/srv/app` reads the same as a config entry pointing at the same host;
+ * `name` is what the user typed, kept only so a reconnect hint can hand back that same string.
+ */
 type ActiveSshTarget = {
 	name: string;
 	remote: string;
@@ -1164,7 +1169,7 @@ function renderSshEditCallBody(args: unknown, theme: Theme, context: SshEditRend
 			}
 		}).catch((error) => logSshEditRenderError("preview", error));
 	}
-	return buildSshEditCallComponent(component, args, theme, target ? target.name : "inactive", context.outputPad);
+	return buildSshEditCallComponent(component, args, theme, target ? target.remote : "inactive", context.outputPad);
 }
 
 /**
@@ -1188,7 +1193,7 @@ function renderSshEditResultBody(result: SshEditToolResult, theme: Theme, contex
 			changed = true;
 		}
 		if (changed) {
-			buildSshEditCallComponent(callComponent, context.args, theme, target ? target.name : "inactive", context.outputPad);
+			buildSshEditCallComponent(callComponent, context.args, theme, target ? target.remote : "inactive", context.outputPad);
 		}
 	}
 	const component = context.lastComponent instanceof Container ? context.lastComponent : new Container();
@@ -1252,7 +1257,7 @@ function renderSshWriteCall(
 	) as SshWriteCallComponent;
 	const title =
 		`${theme.fg("toolTitle", theme.bold("ssh_write"))} ${theme.fg("accent", path || "...")} ` +
-		theme.fg("muted", `[${target ? target.name : "inactive"}]`);
+		theme.fg("muted", `[${target ? target.remote : "inactive"}]`);
 	// Same three cases the write row has: no content argument yet, empty content, real content.
 	const content = input.content === undefined ? "" : typeof input.content === "string" ? input.content : null;
 	if (content === null) {
@@ -1285,7 +1290,7 @@ function createRemoteBashOps(target: ActiveSshTarget, overrideCwd?: string): Bas
 			// The guard is the one thing -e was quietly doing - keeping a command out of the login
 			// directory when the requested one is gone - said out loud instead of by side effect.
 			const script =
-				`cd ${shellQuote(dir)} || { echo ${shellQuote(`Cannot change to ${dir} on ${target.name} - the command did not run.`)} >&2; exit 1; }\n${command}\n`;
+				`cd ${shellQuote(dir)} || { echo ${shellQuote(`Cannot change to ${dir} on ${target.remote} - the command did not run.`)} >&2; exit 1; }\n${command}\n`;
 			const { exitCode, stderr } = await sshExec(target.remote, "exec bash -s", {
 				stdin: script,
 				signal,
@@ -1408,7 +1413,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		}
 		ctx.ui.setStatus(
 			SSH_STATUS_KEY,
-			ctx.ui.theme.fg("accent", `SSH ${activeTarget.name}:${activeTarget.remoteCwd}`),
+			ctx.ui.theme.fg("accent", `SSH ${activeTarget.remote}:${activeTarget.remoteCwd}`),
 		);
 	};
 
@@ -1423,7 +1428,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget(
 			SSH_NOTICE_KEY,
 			[
-				ctx.ui.theme.fg("accent", `SSH ${state.name}  ${state.remoteCwd}`),
+				ctx.ui.theme.fg("accent", `SSH ${state.remote}  ${state.remoteCwd}`),
 				ctx.ui.theme.fg(
 					"muted",
 					`${STATE_ORIGIN_NOTES[origin]} · ! and !! run remotely · prefix local: for local`,
@@ -1518,7 +1523,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				const detail = summarizeError(stderrText);
 				const reason = sshTransportFailure(stderrText) ?? `did not answer (exit ${exitCode})`;
 				warn(
-					`SSH workspace ${target.name} (${target.remote}) is restored, but the host ${reason}${detail ? `: ${detail}` : ""}. Run /ssh status.`,
+					`SSH workspace ${target.remote} is restored, but the host ${reason}${detail ? `: ${detail}` : ""}. Run /ssh status.`,
 				);
 			})
 			.catch((error: unknown) => {
@@ -1529,7 +1534,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				const reason = message.startsWith("timeout:")
 					? `no answer within ${PROBE_TIMEOUT_SECONDS}s`
 					: message || "unknown error";
-				warn(`SSH workspace ${target.name} (${target.remote}) is restored, but the host is not reachable (${reason}). Run /ssh status.`);
+				warn(`SSH workspace ${target.remote} is restored, but the host is not reachable (${reason}). Run /ssh status.`);
 			});
 	};
 
@@ -1545,7 +1550,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		// A restored workspace the user just replaced by hand no longer needs reminding.
 		hideWorkspaceNotice(ctx);
 		ctx.ui.notify(
-			`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd}). ! and !! run remotely; prefix a command with local: to run it locally.`,
+			`SSH mode on: ${activeTarget.remote}:${activeTarget.remoteCwd}. ! and !! run remotely; prefix a command with local: to run it locally.`,
 			"info",
 		);
 	};
@@ -1582,7 +1587,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
 			const range = formatReadLineRange(args?.offset, args?.limit);
-			const targetLabel = activeTarget ? activeTarget.name : "inactive";
+			const targetLabel = activeTarget ? activeTarget.remote : "inactive";
 			return new Text(
 				`${theme.fg("toolTitle", theme.bold("ssh_read"))} ${theme.fg("accent", path)}` +
 					(range ? theme.fg("warning", range) : "") +
@@ -1666,7 +1671,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			startToolTimer(context);
 			const command = typeof args?.command === "string" ? args.command : "...";
 			const timeout = typeof args?.timeout === "number" && args.timeout > 0 ? args.timeout : undefined;
-			const targetLabel = activeTarget ? activeTarget.name : "inactive";
+			const targetLabel = activeTarget ? activeTarget.remote : "inactive";
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			text.setText(
 				`${theme.fg("toolTitle", theme.bold("ssh_bash"))} ${theme.fg("accent", command)}` +
@@ -1714,7 +1719,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify(
-					`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd}) - ${STATE_ORIGIN_NOTES[stateOrigin]}. ${gateNote}.`,
+					`SSH mode: ${activeTarget.remote}:${activeTarget.remoteCwd} - ${STATE_ORIGIN_NOTES[stateOrigin]}. ${gateNote}.`,
 					"info",
 				);
 				return;
@@ -1793,7 +1798,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		if (!active) {
 			// The user turned SSH off on purpose; a later session must not resurrect it.
 			ctx.ui.notify(
-				`SSH mode stays off (${inherited.name}:${inherited.remoteCwd}) - /ssh ${inherited.name} reconnects`,
+				`SSH mode stays off (${inherited.remote}:${inherited.remoteCwd}) - /ssh ${inherited.name} reconnects`,
 				"info",
 			);
 			return;
@@ -1838,7 +1843,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		hideWorkspaceNotice(ctx);
 		updateStatus(ctx);
 		if (changed) {
-			ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${inherited.name} is not connected at this point`, "info");
+			ctx.ui.notify(`${wasActive ? "SSH mode off" : "SSH mode stays off"} - ${inherited.remote} is not connected at this point`, "info");
 		}
 	});
 

@@ -318,6 +318,11 @@ export function rowRaw(component: any, width = 90): string[] {
 	return component.render(width);
 }
 
+/** Text as the user reads it, without colours or file links. */
+export function plain(text: string): string {
+	return text.replace(ANSI, "").replace(OSC_LINK, "");
+}
+
 export function textResult(text: string) {
 	return { content: [{ type: "text", text }], details: undefined, isError: false, timestamp: 0 };
 }
